@@ -32,10 +32,17 @@ class Settings(BaseSettings):
     llm_consolidation_max_tokens: int = 1024
 
     # Hybrid retrieval weights
-    dense_weight: float = 0.55
-    keyword_weight: float = 0.25
+    dense_weight: float = 0.50
+    keyword_weight: float = 0.30
     recency_weight: float = 0.20
-    dense_recall_multiplier: int = 4
+    dense_recall_multiplier: int = 8
+
+    # Keyword scoring enhancement
+    keyword_ngram_max: int = 3
+    keyword_phrase_weight: float = 0.7
+
+    # Memory storage fallback
+    enable_raw_sentence_fallback: bool = True
 
     # App behavior
     log_level: str = "INFO"

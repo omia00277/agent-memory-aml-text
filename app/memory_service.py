@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Union
 
 from app.config import settings
-from app.consolidator import consolidate
+from app.consolidator import _split_sentences, consolidate
 from app.database import MemoryUnit, RawChunk, SessionLocal
 from app.qdrant_store import qdrant_store
 from app.schemas import (
@@ -66,7 +66,28 @@ def _tokens(text: str) -> List[str]:
     return ascii_tokens + bigrams
 
 
+def _ngrams(text: str, n: int) -> List[str]:
+    """Extract character n-grams for phrase matching."""
+    text = text.lower()
+    # For CJK, use character n-grams; for ASCII, use word n-grams.
+    ascii_words = re.findall(r"[a-z0-9_]+", text)
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
+    result = []
+    if len(ascii_words) >= n:
+        result.extend(
+            " ".join(ascii_words[i : i + n])
+            for i in range(len(ascii_words) - n + 1)
+        )
+    if len(cjk_chars) >= n:
+        result.extend(
+            "".join(cjk_chars[i : i + n])
+            for i in range(len(cjk_chars) - n + 1)
+        )
+    return result
+
+
 def _keyword_score(query: str, document: str) -> float:
+    """Token overlap + phrase n-gram matching."""
     q_tokens = set(_tokens(query))
     if not q_tokens:
         return 0.0
@@ -74,7 +95,22 @@ def _keyword_score(query: str, document: str) -> float:
     overlap = q_tokens.intersection(d_tokens)
     if not overlap:
         return 0.0
-    return len(overlap) / len(q_tokens)
+    token_score = len(overlap) / len(q_tokens)
+
+    # Phrase n-gram matching
+    phrase_total = 0
+    phrase_hits = 0
+    for n in range(2, settings.keyword_ngram_max + 1):
+        q_ng = _ngrams(query, n)
+        if not q_ng:
+            continue
+        d_ng_set = set(_ngrams(document, n))
+        phrase_total += len(q_ng)
+        phrase_hits += sum(1 for ng in q_ng if ng in d_ng_set)
+    phrase_score = phrase_hits / phrase_total if phrase_total > 0 else 0.0
+
+    weight = settings.keyword_phrase_weight
+    return (1 - weight) * token_score + weight * phrase_score
 
 
 def _normalize_dense_scores(candidates: List[dict]) -> List[dict]:
@@ -94,6 +130,30 @@ def _recency_score(source_ts: Optional[int], latest_ts: Optional[int]) -> float:
     # 30-day half-life in milliseconds; newer facts score closer to 1.
     half_life_ms = 30 * 24 * 3600 * 1000
     return math.pow(0.5, age_ms / half_life_ms)
+
+
+_FILLER_PHRASES = {
+    "好的", "嗯", "啊", "哦", "行", "可以", "知道了", "明白了", "我记住了",
+    "谢谢", "不客气", "没问题", "再见", "拜拜", "是的", "对", "没错",
+    "了解了", "清楚了", "收到", "好呢", "好滴", "好哒",
+}
+
+
+def _is_meaningful_raw_sentence(sentence: str) -> bool:
+    """Filter out conversational fillers and overly short raw sentences."""
+    s = sentence.strip()
+    if len(s) < 5:
+        return False
+    # Drop if it consists only of filler phrases or punctuation
+    cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", s)
+    if cleaned in _FILLER_PHRASES:
+        return False
+    # Drop if it starts with a common filler followed by punctuation
+    lower = s.lower()
+    for filler in _FILLER_PHRASES:
+        if lower.startswith(filler) and len(lower) <= len(filler) + 3:
+            return False
+    return True
 
 
 def _build_query_text(query: Union[str, List[dict]], options: Optional[List[str]]) -> str:
@@ -134,11 +194,35 @@ def add_memory(request: AddRequest) -> AddResponse:
         db.commit()
         db.refresh(raw)
 
-        units = consolidate(text)
-        if not units:
-            units = [text]
+        consolidated = consolidate(text)
+        if not consolidated:
+            consolidated = [text]
 
-        unit_contents = list(dict.fromkeys(units))
+        # Add raw sentences as fallback units to preserve original details
+        # that LLM consolidation may drop or over-generalize.
+        raw_sentences = []
+        if settings.enable_raw_sentence_fallback:
+            for s in _split_sentences(text):
+                # Skip conversational fillers and overly short sentences
+                if not _is_meaningful_raw_sentence(s):
+                    continue
+                # Keep raw sentence if it is not already subsumed by a consolidated fact
+                if not any(s in fact or fact in s for fact in consolidated):
+                    raw_sentences.append(s)
+
+        # Preserve order: facts first, raw fallbacks after; deduplicate exact strings
+        seen = set()
+        unit_contents = []
+        unit_types = []
+        for content, unit_type in [(c, "fact") for c in consolidated] + [
+            (c, "raw") for c in raw_sentences
+        ]:
+            key = content.strip()
+            if key and key not in seen:
+                seen.add(key)
+                unit_contents.append(content)
+                unit_types.append(unit_type)
+
         vectors = sf_client.embed(unit_contents)
 
         for idx, content in enumerate(unit_contents):
@@ -147,7 +231,7 @@ def add_memory(request: AddRequest) -> AddResponse:
                 session_id=request.session_id,
                 source_request_id=request.request_id,
                 content=content,
-                unit_type="fact",
+                unit_type=unit_types[idx],
                 source_ts=source_ts,
                 created_at=created_at,
             )
@@ -160,7 +244,7 @@ def add_memory(request: AddRequest) -> AddResponse:
                 vector=vectors[idx],
                 point_id=unit.id,
                 created_at=created_at,
-                unit_type="fact",
+                unit_type=unit_types[idx],
                 source_ts=source_ts,
                 source_request_id=request.request_id,
             )

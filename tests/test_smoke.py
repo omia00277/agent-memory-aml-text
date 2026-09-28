@@ -27,7 +27,11 @@ def test_add_and_search_mock(mocker):
     import app.qdrant_store as qs
 
     mocker.patch.object(ms, "consolidate", return_value=["用户喜欢燕麦拿铁。"])
-    mocker.patch.object(ms.sf_client, "embed", return_value=[[0.1] * 1024])
+    mocker.patch.object(
+        ms.sf_client,
+        "embed",
+        side_effect=lambda texts: [[0.1] * 1024 for _ in texts],
+    )
     mocker.patch.object(ms.sf_client, "rerank", return_value=[])
     mocker.patch.object(
         qs.qdrant_store,
