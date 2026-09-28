@@ -1,0 +1,47 @@
+# Virtual environments
+venv/
+agent_memory_dl/
+
+# Environment variables
+.env
+
+# Database files
+*.db
+
+# Qdrant local storage
+qdrant_storage/
+qdrant_storage_stepcheck/
+qdrant_bench/
+test_qdrant_storage/
+test_qdrant_storage_stepcheck/
+
+# Benchmark results
+bench_results*.json
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDFs and extracted text copies (reference materials, large binaries)
+*.pdf
+aml.txt
+aml2.txt
+csig.txt
+challenge.txt
+
+# Runtime Qdrant folders (test_ prefix without _storage)
+test_qdrant/
+test_qdrant_storage/

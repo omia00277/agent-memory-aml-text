@@ -1,0 +1,29 @@
+LoCoMo Refined Attribution Notice
+
+This benchmark is a modified version of the LoCoMo release from Snap
+Research:
+
+- Project: LoCoMo
+- Upstream repository: https://github.com/snap-research/locomo
+- Paper: "Evaluating Very Long-Term Conversational Memory of LLM Agents"
+  (ACL 2024 / arXiv:2402.17753)
+
+The upstream LoCoMo material included in or adapted for this benchmark
+is distributed under Creative Commons Attribution-NonCommercial 4.0
+International (CC BY-NC 4.0). See LICENSE.txt.
+
+LoCoMo Refined makes benchmark-specific modifications on top of the
+upstream release, including:
+
+- correcting a subset of inaccurate or low-quality questions
+- refining benchmark data used for public evaluation
+- updating and tuning the judge / evaluator behavior for more stable
+  scoring
+- restructuring the runnable evaluation package for standalone use
+
+If you share this benchmark or derivatives of it, retain this notice,
+retain the CC BY-NC 4.0 license notice, and indicate that LoCoMo
+Refined is a modified version of the upstream LoCoMo release.
+
+This benchmark is intended for non-commercial use unless you have
+separate permission from the relevant rights holders.
