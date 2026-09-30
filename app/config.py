@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # Model names
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    llm_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    llm_model: str = "Qwen/Qwen3-8B"
 
     # Qdrant configuration
     qdrant_url: str = ""
