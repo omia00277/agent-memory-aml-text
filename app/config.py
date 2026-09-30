@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     search_dedup_threshold: float = 0.85
 
     # Raw sentence fallback controls
-    raw_fallback_per_chunk: int = 5
+    raw_fallback_per_chunk: int = 8
     raw_fallback_min_score: float = 0.3
     temporal_priority_boost: float = 0.25
 
