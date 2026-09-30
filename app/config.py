@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # Search result deduplication
     search_dedup_threshold: float = 0.85
 
+    # API authentication for AML platform calls (Token / Bearer / X-Api-Key).
+    # If empty, no authentication is required (useful for public smoke tests).
+    memory_system_key: str = ""
+
     # Raw sentence fallback controls
     raw_fallback_per_chunk: int = 8
     raw_fallback_min_score: float = 0.3
