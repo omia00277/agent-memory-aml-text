@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # Search result deduplication
     search_dedup_threshold: float = 0.85
 
+    # Raw sentence fallback controls
+    raw_fallback_per_chunk: int = 5
+    raw_fallback_min_score: float = 0.3
+    temporal_priority_boost: float = 0.25
+
     # App behavior
     log_level: str = "INFO"
     top_k_default: int = 100

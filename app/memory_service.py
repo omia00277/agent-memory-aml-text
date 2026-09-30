@@ -156,6 +156,58 @@ def _is_meaningful_raw_sentence(sentence: str) -> bool:
     return True
 
 
+# Patterns to detect temporal / sequential information in raw sentences.
+_TEMPORAL_PATTERNS = [
+    r"\d{4}年", r"\d{1,2}月", r"\d{1,2}日",
+    r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", r"\b\d{4}-\d{2}-\d{2}\b",
+    r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b",
+    r"\b(?:last|next|this|every|each)\s+(?:week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|morning|afternoon|evening|night|day|weekend)\b",
+    r"\b\d+\s+(?:minutes?|hours?|days?|weeks?|months?|years?)\s+(?:ago|later|after|before)\b",
+    r"\b(?:first|then|after\s+that|before|later|earlier|finally|next|previously)\b",
+    r"\b(?:when|while|during|until|since)\b",
+]
+
+
+def _contains_temporal_info(text: str) -> bool:
+    """Check whether a sentence contains explicit temporal or sequential information."""
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in _TEMPORAL_PATTERNS)
+
+
+def _score_raw_sentence(sentence: str, consolidated: List[str]) -> float:
+    """Score a raw sentence by informativeness; higher is better."""
+    s = sentence.strip()
+    if not s:
+        return 0.0
+
+    # 1. Length score: prefer 15~80 chars, penalize too short or too long
+    length = len(s)
+    length_score = max(0.0, 1.0 - abs(length - 45) / 80)
+
+    # 2. Entity density: more named/semantic entities is better
+    cjk_entities = len(re.findall(r"[\u4e00-\u9fff]{2,}", s))
+    ascii_entities = len(re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*", s))
+    entity_score = min(1.0, (cjk_entities + ascii_entities) / 5)
+
+    # 3. Novelty vs consolidated facts: lower overlap with facts means more new info
+    if consolidated:
+        max_overlap = max(_text_similarity(s, fact) for fact in consolidated)
+        novelty_score = 1.0 - max_overlap
+    else:
+        novelty_score = 1.0
+
+    # 4. Content-word ratio: more nouns/verbs/adjectives vs stopwords
+    content_chars = len(re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]{2,}", s))
+    content_ratio = content_chars / max(length, 1)
+    content_score = min(1.0, content_ratio * 2.5)
+
+    # 5. Temporal boost: prefer sentences that carry time/sequence info
+    temporal_boost = settings.temporal_priority_boost if _contains_temporal_info(s) else 0.0
+
+    score = 0.25 * length_score + 0.30 * entity_score + 0.25 * novelty_score + 0.20 * content_score + temporal_boost
+    return score
+
+
 def _build_query_text(query: Union[str, List[dict]], options: Optional[List[str]]) -> str:
     q = _normalize_content(query)
     if options:
@@ -240,13 +292,27 @@ def add_memory(request: AddRequest) -> AddResponse:
         # that LLM consolidation may drop or over-generalize.
         raw_sentences = []
         if settings.enable_raw_sentence_fallback:
+            raw_candidates = []
             for s in _split_sentences(text):
                 # Skip conversational fillers and overly short sentences
                 if not _is_meaningful_raw_sentence(s):
                     continue
-                # Keep raw sentence if it is not already subsumed by a consolidated fact
-                if not any(s in fact or fact in s for fact in consolidated):
-                    raw_sentences.append(s)
+                # Skip raw sentences already subsumed by a consolidated fact
+                if any(s in fact or fact in s for fact in consolidated):
+                    continue
+                # Skip near-duplicate of any consolidated fact
+                if consolidated and any(
+                    _is_near_duplicate(s, fact, settings.search_dedup_threshold)
+                    for fact in consolidated
+                ):
+                    continue
+                score = _score_raw_sentence(s, consolidated)
+                if score >= settings.raw_fallback_min_score:
+                    raw_candidates.append((score, s))
+
+            # Sort by informativeness and keep only the top N per chunk
+            raw_candidates.sort(key=lambda x: x[0], reverse=True)
+            raw_sentences = [s for _, s in raw_candidates[: settings.raw_fallback_per_chunk]]
 
         # Preserve order: facts first, raw fallbacks after; deduplicate exact strings
         seen = set()
