@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # Memory storage fallback
     enable_raw_sentence_fallback: bool = True
 
+    # Search result deduplication
+    search_dedup_threshold: float = 0.85
+
     # App behavior
     log_level: str = "INFO"
     top_k_default: int = 100

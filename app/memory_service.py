@@ -163,6 +163,44 @@ def _build_query_text(query: Union[str, List[dict]], options: Optional[List[str]
     return q
 
 
+def _text_similarity(a: str, b: str) -> float:
+    """Compute token overlap ratio for near-duplicate detection."""
+    a_tokens = set(_tokens(a))
+    b_tokens = set(_tokens(b))
+    if not a_tokens or not b_tokens:
+        return 0.0
+    intersection = a_tokens & b_tokens
+    union = a_tokens | b_tokens
+    return len(intersection) / len(union)
+
+
+def _is_near_duplicate(a: str, b: str, threshold: float) -> bool:
+    """Check if two memory contents are near-duplicates."""
+    a_norm = a.strip().lower()
+    b_norm = b.strip().lower()
+    if not a_norm or not b_norm:
+        return True
+    # Exact or substring containment
+    if a_norm == b_norm or a_norm in b_norm or b_norm in a_norm:
+        return True
+    # High token overlap
+    return _text_similarity(a_norm, b_norm) >= threshold
+
+
+def _deduplicate_results(
+    candidates: List[dict], threshold: Optional[float] = None
+) -> List[dict]:
+    """Remove near-duplicate memory contents, keeping the higher-scored one."""
+    threshold = threshold if threshold is not None else settings.search_dedup_threshold
+    selected: List[dict] = []
+    for c in candidates:
+        content = c.get("content", "")
+        if any(_is_near_duplicate(content, s.get("content", ""), threshold) for s in selected):
+            continue
+        selected.append(c)
+    return selected
+
+
 def add_memory(request: AddRequest) -> AddResponse:
     """Synchronous add: persist chunk and consolidated units, then make them searchable."""
     db = SessionLocal()
@@ -329,7 +367,10 @@ def search_memory(request: SearchRequest) -> SearchResponse:
         for c in ordered:
             c["score"] = c["hybrid_score"]
 
-    final = ordered[: request.top_k]
+    # Deduplicate near-duplicate contents before returning top_k.
+    # ordered is already ranked by relevance, so we keep the first (best) occurrence.
+    deduped = _deduplicate_results(ordered)
+    final = deduped[: request.top_k]
 
     data = [
         MemoryItem(

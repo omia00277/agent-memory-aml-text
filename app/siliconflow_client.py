@@ -18,6 +18,7 @@ class SiliconFlowClient:
         self.openai_client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
+            timeout=60.0,
         )
         self.http_client = httpx.Client(
             base_url=self.base_url,
