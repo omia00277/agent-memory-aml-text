@@ -27,7 +27,7 @@ def _verify_auth(credentials: HTTPAuthorizationCredentials, request: Request):
         return
 
     provided = None
-    if credentials and credentials.scheme.lower() == "bearer":
+    if credentials and credentials.scheme.lower() in ("bearer", "token"):
         provided = credentials.credentials
     elif request.headers.get("x-api-key"):
         provided = request.headers.get("x-api-key")
