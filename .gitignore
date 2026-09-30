@@ -45,3 +45,4 @@ challenge.txt
 # Runtime Qdrant folders (test_ prefix without _storage)
 test_qdrant/
 test_qdrant_storage/
+pdf_extracts/
