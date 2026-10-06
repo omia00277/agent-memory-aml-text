@@ -10,16 +10,33 @@ logger = logging.getLogger(__name__)
 
 
 class SiliconFlowClient:
-    """Thin client for SiliconFlow embedding, reranker and chat APIs."""
+    """Thin client for embedding, reranker and chat APIs.
+
+    Embedding and reranker use SiliconFlow; chat (LLM consolidation) uses the
+    configured OpenAI-compatible endpoint (required to be gpt-4o-mini for AML
+    academic track).
+    """
 
     def __init__(self):
         self.api_key = settings.siliconflow_api_key
         self.base_url = settings.siliconflow_base_url
-        self.openai_client = OpenAI(
+
+        # Embedding client: SiliconFlow
+        self.embed_client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=60.0,
         )
+
+        # Chat client: OpenAI-compatible endpoint (defaults to OpenAI)
+        chat_api_key = settings.openai_api_key or self.api_key
+        chat_base_url = settings.openai_base_url or self.base_url
+        self.chat_client = OpenAI(
+            api_key=chat_api_key,
+            base_url=chat_base_url,
+            timeout=60.0,
+        )
+
         self.http_client = httpx.Client(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -32,7 +49,7 @@ class SiliconFlowClient:
         if not texts:
             return []
         try:
-            response = self.openai_client.embeddings.create(
+            response = self.embed_client.embeddings.create(
                 model=settings.embedding_model,
                 input=texts,
                 encoding_format="float",
@@ -70,8 +87,8 @@ class SiliconFlowClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def chat(self, messages: List[dict], temperature: float = 0.1, max_tokens: int = 512) -> str:
-        """Call SiliconFlow chat completions. Used for async fact/entity extraction."""
-        response = self.openai_client.chat.completions.create(
+        """Call chat completions for fact/entity extraction."""
+        response = self.chat_client.chat.completions.create(
             model=settings.llm_model,
             messages=messages,
             temperature=temperature,

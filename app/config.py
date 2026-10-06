@@ -10,14 +10,18 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # SiliconFlow API
+    # SiliconFlow API (used for embedding and reranker)
     siliconflow_api_key: str
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+
+    # OpenAI-compatible API (used for LLM consolidation; required for AML academic track)
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
 
     # Model names
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    llm_model: str = "Qwen/Qwen3-8B"
+    llm_model: str = "gpt-4o-mini"
 
     # Qdrant configuration
     qdrant_url: str = ""
