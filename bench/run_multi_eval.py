@@ -28,7 +28,7 @@ try:
 except Exception:
     pass
 
-from app.database import SessionLocal, init_db
+from app.database import init_db
 from app.memory_service import add_memory, search_memory
 from app.schemas import AddRequest, Message, SearchRequest
 
@@ -64,7 +64,7 @@ def answer_in_results(answer: str, items: list) -> bool:
     return False
 
 
-def run_locomo_refined(db, sample_ratio: float, top_k: int):
+def run_locomo_refined(sample_ratio: float, top_k: int):
     data_dir = Path("LoCoMo_refined-main/LoCoMo_refined-main/data/public")
     if not data_dir.exists():
         print(f"[LoCoMo-Refined] data dir not found: {data_dir}")
@@ -97,7 +97,7 @@ def run_locomo_refined(db, sample_ratio: float, top_k: int):
                 session_id=sid,
             )
             try:
-                add_memory(req, db=db)
+                add_memory(req)
                 totals["chunks"] += 1
                 print(f"  add {i + 1}/{len(chunks)} ok")
             except Exception as e:
@@ -127,7 +127,7 @@ def run_locomo_refined(db, sample_ratio: float, top_k: int):
 
             try:
                 t0 = time.time()
-                result = search_memory(SearchRequest(query=q["question"], user_id=sid, top_k=top_k), db=db)
+                result = search_memory(SearchRequest(query=q["question"], user_id=sid, top_k=top_k))
                 latency = time.time() - t0
                 items = result.data
 
@@ -245,7 +245,7 @@ def stream_lme_items(path: Path, sample_ratio: float):
                 yield json.loads(obj_text)
 
 
-def run_longmemeval_s(db, sample_ratio: float, top_k: int):
+def run_longmemeval_s(sample_ratio: float, top_k: int):
     path = Path("data_external/longmemeval_s_cleaned.json")
     if not path.exists():
         print(f"[LongMemEval-S] data file not found: {path}")
@@ -292,7 +292,7 @@ def run_longmemeval_s(db, sample_ratio: float, top_k: int):
                 user_id=f"lme-{qid}",
                 session_id=f"lme-{qid}",
             )
-            add_memory(add_req, db=db)
+            add_memory(add_req)
             add_success += 1
             total_latency_add += time.time() - t0
             total_adds += 1
@@ -304,7 +304,7 @@ def run_longmemeval_s(db, sample_ratio: float, top_k: int):
         # Search
         try:
             t0 = time.time()
-            result = search_memory(SearchRequest(query=question, user_id=f"lme-{qid}", top_k=top_k), db=db)
+            result = search_memory(SearchRequest(query=question, user_id=f"lme-{qid}", top_k=top_k))
             latency = time.time() - t0
             total_latency_search += latency
             total_searches += 1
@@ -352,18 +352,14 @@ def main():
     args = parser.parse_args()
 
     init_db()
-    db = SessionLocal()
     results = {}
 
-    try:
-        for dataset in args.datasets:
-            print(f"\n{'='*40}\nRunning {dataset}\n{'='*40}")
-            if dataset == "locomorefined":
-                results[dataset] = run_locomo_refined(db, args.sample_ratio, args.top_k)
-            elif dataset == "longmemevals":
-                results[dataset] = run_longmemeval_s(db, args.sample_ratio, args.top_k)
-    finally:
-        db.close()
+    for dataset in args.datasets:
+        print(f"\n{'='*40}\nRunning {dataset}\n{'='*40}")
+        if dataset == "locomorefined":
+            results[dataset] = run_locomo_refined(args.sample_ratio, args.top_k)
+        elif dataset == "longmemevals":
+            results[dataset] = run_longmemeval_s(args.sample_ratio, args.top_k)
 
     print("\n" + "=" * 40)
     print("SUMMARY")
