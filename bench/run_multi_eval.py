@@ -28,7 +28,7 @@ try:
 except Exception:
     pass
 
-from app.database import init_db
+from app.database import SessionLocal, init_db
 from app.memory_service import add_memory, search_memory
 from app.schemas import AddRequest, Message, SearchRequest
 
@@ -65,6 +65,7 @@ def answer_in_results(answer: str, items: list) -> bool:
 
 
 def run_locomo_refined(sample_ratio: float, top_k: int):
+    db = SessionLocal()
     data_dir = Path("LoCoMo_refined-main/LoCoMo_refined-main/data/public")
     if not data_dir.exists():
         print(f"[LoCoMo-Refined] data dir not found: {data_dir}")
@@ -134,14 +135,10 @@ def run_locomo_refined(sample_ratio: float, top_k: int):
                 first_hit_rank = None
                 covered = set()
                 for rank, item in enumerate(items, start=1):
-                    # item.id is uuid; we need to map back to source chunk
-                    # MemoryUnit payload has source_request_id
-                    src = getattr(item, "source_request_id", None)
-                    if src is None:
-                        # Fallback: query db
-                        from app.database import MemoryUnit as DBMemoryUnit
-                        unit = db.query(DBMemoryUnit).filter(DBMemoryUnit.id == item.id).first()
-                        src = unit.source_request_id if unit else None
+                    # item.id is uuid; map back to source chunk via DB
+                    from app.database import MemoryUnit as DBMemoryUnit
+                    unit = db.query(DBMemoryUnit).filter(DBMemoryUnit.id == item.id).first()
+                    src = unit.source_request_id if unit else None
                     dias = chunk_map.get(src, set())
                     overlap = dias & gold
                     if overlap:
@@ -197,6 +194,7 @@ def run_locomo_refined(sample_ratio: float, top_k: int):
             for cat, c in per_category.items()
         },
     }
+    db.close()
     return summary
 
 
