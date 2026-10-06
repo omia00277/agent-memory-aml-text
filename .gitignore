@@ -47,3 +47,5 @@ test_qdrant/
 test_qdrant_storage/
 pdf_extracts/
 sshpass_*.deb
+qdrant_test_gpt4o/
+test_gpt4o.db
