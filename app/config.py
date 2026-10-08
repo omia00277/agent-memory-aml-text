@@ -10,16 +10,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # SiliconFlow API (used for embedding and reranker)
+    # SiliconFlow API (used for reranker)
     siliconflow_api_key: str
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+
+    # Alibaba Cloud (Bailian) API (used for text-embedding-v4; required for AML academic track)
+    aliyun_api_key: str = ""
+    aliyun_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # OpenAI-compatible API (used for LLM consolidation; required for AML academic track)
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
 
     # Model names
-    embedding_model: str = "BAAI/bge-m3"
+    embedding_model: str = "text-embedding-v4"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     llm_model: str = "gpt-4o-mini"
 

@@ -12,19 +12,21 @@ logger = logging.getLogger(__name__)
 class SiliconFlowClient:
     """Thin client for embedding, reranker and chat APIs.
 
-    Embedding and reranker use SiliconFlow; chat (LLM consolidation) uses the
-    configured OpenAI-compatible endpoint (required to be gpt-4o-mini for AML
-    academic track).
+    Embedding uses Alibaba Cloud text-embedding-v4; reranker uses SiliconFlow;
+    chat (LLM consolidation) uses the configured OpenAI-compatible endpoint
+    (required to be gpt-4o-mini for AML academic track).
     """
 
     def __init__(self):
         self.api_key = settings.siliconflow_api_key
         self.base_url = settings.siliconflow_base_url
 
-        # Embedding client: SiliconFlow
+        # Embedding client: Alibaba Cloud (Bailian)
+        embed_api_key = settings.aliyun_api_key or self.api_key
+        embed_base_url = settings.aliyun_base_url or self.base_url
         self.embed_client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
+            api_key=embed_api_key,
+            base_url=embed_base_url,
             timeout=60.0,
         )
 
