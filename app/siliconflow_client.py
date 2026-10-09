@@ -47,16 +47,25 @@ class SiliconFlowClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def embed(self, texts: List[str]) -> List[List[float]]:
-        """Embed a batch of texts using the configured embedding model."""
+        """Embed a batch of texts using the configured embedding model.
+
+        Batches are split into chunks of 10 because some providers (e.g. Alibaba
+        Cloud text-embedding-v4) enforce a max batch size of 10.
+        """
         if not texts:
             return []
         try:
-            response = self.embed_client.embeddings.create(
-                model=settings.embedding_model,
-                input=texts,
-                encoding_format="float",
-            )
-            return [item.embedding for item in response.data]
+            all_embeddings = []
+            batch_size = 10
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                response = self.embed_client.embeddings.create(
+                    model=settings.embedding_model,
+                    input=batch,
+                    encoding_format="float",
+                )
+                all_embeddings.extend([item.embedding for item in response.data])
+            return all_embeddings
         except Exception as e:
             logger.error(f"Embedding failed: {e}")
             raise

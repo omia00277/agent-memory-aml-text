@@ -64,6 +64,13 @@ class MemoryUnit(Base):
     source_ts = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+    # Structured fields for conflict detection / current-state tracking
+    entity = Column(String(255), nullable=True, index=True)
+    attribute = Column(String(255), nullable=True, index=True)
+    value = Column(Text, nullable=True)
+    valid = Column(Integer, nullable=False, default=1, index=True)  # 1 = valid, 0 = superseded
+    superseded_by = Column(String(64), nullable=True, index=True)
+
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -80,3 +87,16 @@ def _migrate_sqlite():
         if "source_ts" not in existing:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE raw_chunks ADD COLUMN source_ts INTEGER"))
+    if "memory_units" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("memory_units")}
+        new_cols = [
+            ("entity", "VARCHAR(255)"),
+            ("attribute", "VARCHAR(255)"),
+            ("value", "TEXT"),
+            ("valid", "INTEGER DEFAULT 1"),
+            ("superseded_by", "VARCHAR(64)"),
+        ]
+        for col, dtype in new_cols:
+            if col not in existing:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE memory_units ADD COLUMN {col} {dtype}"))
