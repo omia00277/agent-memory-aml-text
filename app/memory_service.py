@@ -259,18 +259,23 @@ def _deduplicate_results(
 # ---------------------------------------------------------------------------
 
 _ENTITY_ATTR_PATTERNS = [
+    # NOTE: this regex set is a *fallback* used only when the LLM did not return
+    # structured fields. It deliberately matches only *state* phrasings (X lives
+    # in Y). Event phrasings such as "moved to X" are excluded on purpose: a move
+    # is an event, and turning it into "居住地=X" would let an event unit supersede
+    # a real state unit (see _apply_supersession).
     # 居住地 - Chinese
-    (r"(?:住|居住|搬到|生活在|工作在)\s*(?:在|到)?\s*([^，。,.；;！!？?]+?)(?:\s*(?:附近|旁边|区|市|省|国|里|那里))?\s*[，。,.；;！!？?]", "居住地"),
+    (r"(?:住|居住|生活在)\s*(?:在|于)?\s*([^，。,.；;！!？?]+?)(?:\s*(?:附近|旁边|区|市|省|国|里|那里))?\s*[，。,.；;！!？?]", "居住地"),
     # 居住地 - English
-    (r"(?:live\s+in|lived\s+in|moved\s+(?:to|in)|live\s+at|located\s+in)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "居住地"),
+    (r"(?:live\s+in|lived\s+in|reside\s+in|live\s+at|located\s+in)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "居住地"),
     # 手机号 - Chinese
     (r"(?:手机|电话|联系方式)\s*(?:号码|是|为)?\s*[:：]?\s*([\d\-]{7,})", "手机号"),
     # 手机号 - English
     (r"(?:phone|mobile|cell)\s*(?:number|is)?\s*[:：]?\s*([\d\-\+\(\)\s]{7,})", "手机号"),
     # 工作 - Chinese
-    (r"(?:工作|职业|职位|是一名|做)\s*(?:是|为|的)?\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "工作"),
+    (r"(?:工作|职业|职位|是一名)\s*(?:是|为|的)?\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "工作"),
     # 工作 - English
-    (r"(?:work\s+as|job\s+is|work\s+at|works\s+as|am\s+a|is\s+a)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "工作"),
+    (r"(?:work\s+as|job\s+is|works\s+as|am\s+a|is\s+a)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "工作"),
     # 年龄 - Chinese
     (r"(\d{1,3})\s*(?:岁|years?\s*old)", "年龄"),
     # 年龄 - English
@@ -421,24 +426,49 @@ def _create_edges(db, new_unit: MemoryUnit, relations: List[dict]):
         db.add(edge)
 
 
-def _apply_supersession(db, new_unit: MemoryUnit, relations: List[dict]) -> List[str]:
-    """Mark units superseded by ``updates`` relations and mirror it into Qdrant.
+def _apply_supersession(db, new_unit: MemoryUnit) -> List[str]:
+    """Mark older same-attribute units as superseded and mirror it into Qdrant.
+
+    Supersession is decided purely from the structured fields of the units, never
+    from the LLM relation direction: an *event* unit such as "用户上个月搬到上海"
+    must not be allowed to supersede the *state* unit it gives rise to. A unit can
+    only supersede another when it is itself a state fact (attribute + value) and
+    the older unit holds a different value for the same attribute.
 
     The old units are kept (append-only audit trail) but flagged so that Search
     can softly demote them. Returns the list of superseded unit ids.
     """
+    attribute = new_unit.attribute
+    value = new_unit.value
+    if not attribute or value is None or new_unit.unit_type != "fact":
+        return []
+
+    candidates = (
+        db.query(MemoryUnit)
+        .filter(MemoryUnit.user_id == new_unit.user_id)
+        .filter(MemoryUnit.attribute == attribute)
+        .filter(MemoryUnit.id != new_unit.id)
+        .filter(MemoryUnit.superseded_by.is_(None))
+        .all()
+    )
+
     superseded_ids: List[str] = []
-    for rel in relations:
-        if rel.get("relation_type") != RelationType.UPDATES:
+    new_value_norm = str(value).strip().lower()
+    for old in candidates:
+        if old.value is None:
             continue
-        target = db.query(MemoryUnit).filter(MemoryUnit.id == rel["target_unit_id"]).first()
-        if target is None or target.id == new_unit.id:
+        if str(old.value).strip().lower() == new_value_norm:
+            continue  # same value: a duplicate, not an update
+        # Never let an older fact overwrite a newer one (out-of-order Add).
+        if (
+            new_unit.source_ts is not None
+            and old.source_ts is not None
+            and new_unit.source_ts < old.source_ts
+        ):
             continue
-        if target.superseded_by:
-            continue
-        target.superseded_by = new_unit.id
-        db.add(target)
-        superseded_ids.append(target.id)
+        old.superseded_by = new_unit.id
+        db.add(old)
+        superseded_ids.append(old.id)
 
     # Mirror the flag into Qdrant payload so Search sees it without a DB join.
     for unit_id in superseded_ids:
@@ -599,9 +629,10 @@ def add_memory(request: AddRequest) -> AddResponse:
 
             _create_edges(db, unit, relations)
 
-            # Direction A: superseded facts are kept but softly demoted, while the
-            # new fact is a real, first-class memory unit that Search can retrieve.
-            _apply_supersession(db, unit, relations)
+            # Direction A: supersession is derived from the structured fields, not
+            # from the LLM relation direction. Old facts are kept but softly demoted,
+            # while the new fact is a real, first-class memory unit Search can retrieve.
+            _apply_supersession(db, unit)
 
         db.commit()
 
