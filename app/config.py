@@ -39,9 +39,6 @@ class Settings(BaseSettings):
     enable_llm_consolidation: bool = True
     llm_consolidation_max_tokens: int = 1024
 
-    # Structured EAV extraction for conflict detection / current-state tracking
-    enable_llm_eav_extraction: bool = True
-
     # Hybrid retrieval weights
     dense_weight: float = 0.50
     keyword_weight: float = 0.30

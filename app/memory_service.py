@@ -1,4 +1,3 @@
-import json
 import logging
 import math
 import re
@@ -254,178 +253,6 @@ def _deduplicate_results(
     return selected
 
 
-# ---------------------------------------------------------------------------
-# Entity-Attribute-Value (EAV) extraction and conflict-resolution helpers
-# ---------------------------------------------------------------------------
-
-# Common attribute synonyms for normalization.
-_ATTRIBUTE_SYNONYMS = {
-    "居住地": ["住在哪里", "住在哪儿", "住址", "居住城市", "住的城市", "住的地方"],
-    "手机号": ["手机号码", "电话", "联系方式", "联系电话"],
-    "工作": ["职业", "工作职位", "职位", "做什么工作", "工作单位", "工作城市"],
-    "邮箱": ["电子邮箱", "邮件地址", "email"],
-    "姓名": ["名字", "叫什么"],
-    "年龄": ["多大", "几岁"],
-    "状态": ["情况", "现状"],
-}
-
-
-def _normalize_attribute(attr: str) -> str:
-    attr = str(attr).lower().strip()
-    for canon, syns in _ATTRIBUTE_SYNONYMS.items():
-        if attr == canon.lower() or attr in [s.lower() for s in syns]:
-            return canon
-    return attr
-
-
-def _is_same_attribute(attr1: str, attr2: str) -> bool:
-    n1 = _normalize_attribute(attr1)
-    n2 = _normalize_attribute(attr2)
-    if n1 == n2:
-        return True
-    # Fallback: token overlap
-    return _text_similarity(n1, n2) >= 0.80
-
-
-def _is_same_value(v1: str, v2: str) -> bool:
-    s1 = str(v1).lower().strip()
-    s2 = str(v2).lower().strip()
-    if not s1 or not s2:
-        return False
-    if s1 == s2 or s1 in s2 or s2 in s1:
-        return True
-    return _text_similarity(s1, s2) >= 0.85
-
-
-def _rule_based_eav(fact: str) -> Optional[dict]:
-    """Fallback EAV extraction using simple patterns when LLM is unavailable."""
-    text = fact.strip()
-    if not text:
-        return None
-
-    entity = "用户"
-    attribute = "事实"
-    value = text
-
-    # Common patterns
-    # 居住
-    m = re.search(r"(?:住|居住|搬到|生活在|工作在)\s*(?:在|到)?\s*([^，。,.]+?)(?:\s*(?:附近|旁边|区|市|省|国|里|那里))?\s*[，。,.]", text)
-    if m:
-        attribute = "居住地"
-        value = m.group(1).strip()
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    # 手机号
-    m = re.search(r"(?:手机|电话|联系方式)\s*(?:号码|是|为)?\s*[:：]?\s*([\d\-]{7,})", text)
-    if m:
-        attribute = "手机号"
-        value = m.group(1).strip()
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    # 工作/职业
-    m = re.search(r"(?:工作|职业|职位|是一名|做)\s*(?:是|为|的)?\s*[:：]?\s*([^，。,.]+?)(?:\s*[，。,.])", text)
-    if m:
-        attribute = "工作"
-        value = m.group(1).strip()
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    # 年龄
-    m = re.search(r"(\d{1,3})\s*(?:岁|years?\s*old)", text)
-    if m:
-        attribute = "年龄"
-        value = m.group(1).strip() + "岁"
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    # 名字
-    m = re.search(r"(?:叫|姓名|名字是)\s*[:：]?\s*([^，。,.]+?)(?:\s*[，。,.])", text)
-    if m:
-        attribute = "姓名"
-        value = m.group(1).strip()
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    # 毕业/学位
-    m = re.search(r"(?:毕业|获得|取得)\s*(?:了|有)?\s*([^，。,.]*?(?:学位|学历|证书))", text)
-    if m:
-        attribute = "学历"
-        value = m.group(1).strip()
-        return {"entity": entity, "attribute": attribute, "value": value}
-
-    return {"entity": entity, "attribute": attribute, "value": value}
-
-
-_EAV_SYSTEM_PROMPT = """You are a memory structuring assistant. Given a list of factual statements, extract the entity, attribute, and value for each.
-
-Rules:
-1. Entity: the person, object, or concept being described. Use "用户" if the subject is the user.
-2. Attribute: the property or characteristic being asserted (e.g., 居住地, 手机号, 工作).
-3. Value: the specific content of that attribute.
-4. If a statement is a general fact with no clear attribute, use attribute "事实" and value as the whole statement.
-5. Normalize entity to be concise (max 4 words).
-
-Output strictly as JSON:
-{
-  "extractions": [
-    {"entity": "...", "attribute": "...", "value": "..."}
-  ]
-}"""
-
-
-def _extract_eav(facts: List[str]) -> List[Optional[dict]]:
-    """Extract entity/attribute/value for each fact. Falls back to rules if LLM fails or disabled."""
-    if not facts:
-        return []
-
-    # Try LLM first if enabled
-    if settings.enable_llm_eav_extraction:
-        try:
-            prompt = "Extract from these facts:\n" + "\n".join(f"- {f}" for f in facts)
-            response = sf_client.chat(
-                messages=[
-                    {"role": "system", "content": _EAV_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=1024,
-            )
-            data = json.loads(response)
-            extractions = data.get("extractions", [])
-            if len(extractions) == len(facts):
-                return extractions
-        except Exception as e:
-            logger.debug(f"LLM EAV extraction failed: {e}")
-
-    # Fallback to rule-based extraction per fact
-    return [_rule_based_eav(f) for f in facts]
-
-
-def _find_overridden_units(db, user_id: str, extractions: List[Optional[dict]]) -> List[MemoryUnit]:
-    """Find existing valid units that are overridden by the new extractions."""
-    overridden = []
-    for eav in extractions:
-        if not eav:
-            continue
-        entity = eav.get("entity")
-        attribute = eav.get("attribute")
-        value = eav.get("value")
-        if not entity or not attribute or value is None:
-            continue
-
-        candidates = (
-            db.query(MemoryUnit)
-            .filter(
-                MemoryUnit.user_id == user_id,
-                MemoryUnit.valid == 1,
-                MemoryUnit.entity == entity,
-            )
-            .all()
-        )
-        for unit in candidates:
-            if unit.attribute and _is_same_attribute(unit.attribute, attribute):
-                if unit.value and not _is_same_value(unit.value, value):
-                    overridden.append(unit)
-    return overridden
-
-
 def add_memory(request: AddRequest) -> AddResponse:
     """Synchronous add: persist chunk and consolidated units, then make them searchable."""
     db = SessionLocal()
@@ -500,24 +327,9 @@ def add_memory(request: AddRequest) -> AddResponse:
                 unit_contents.append(content)
                 unit_types.append(unit_type)
 
-        # Extract entity-attribute-value for consolidated facts only
-        eav_list = _extract_eav(unit_contents)
-
-        # Find and mark overridden units before inserting new ones
-        overridden_units = _find_overridden_units(db, request.user_id, eav_list)
-        for old_unit in overridden_units:
-            old_unit.valid = 0
-            db.add(old_unit)
-            # Update Qdrant payload to reflect invalid status
-            # (will be updated when we upsert the new unit, but re-upsert old point for safety)
-            # Note: Qdrant does not support partial payload update via upsert? It does: upsert replaces point.
-            # We'll re-upsert the old point with valid=False.
-        db.flush()
-
         vectors = sf_client.embed(unit_contents)
 
         for idx, content in enumerate(unit_contents):
-            eav = eav_list[idx] if idx < len(eav_list) else None
             unit = MemoryUnit(
                 user_id=request.user_id,
                 session_id=request.session_id,
@@ -526,19 +338,9 @@ def add_memory(request: AddRequest) -> AddResponse:
                 unit_type=unit_types[idx],
                 source_ts=source_ts,
                 created_at=created_at,
-                entity=eav.get("entity") if eav else None,
-                attribute=eav.get("attribute") if eav else None,
-                value=eav.get("value") if eav else None,
-                valid=1,
             )
             db.add(unit)
             db.flush()
-
-            # Link overridden units to this new unit
-            for old_unit in overridden_units:
-                if eav and old_unit.attribute and _is_same_attribute(old_unit.attribute, eav.get("attribute", "")):
-                    old_unit.superseded_by = unit.id
-
             qdrant_store.upsert(
                 user_id=request.user_id,
                 session_id=request.session_id,
@@ -549,35 +351,7 @@ def add_memory(request: AddRequest) -> AddResponse:
                 unit_type=unit_types[idx],
                 source_ts=source_ts,
                 source_request_id=request.request_id,
-                entity=eav.get("entity") if eav else None,
-                attribute=eav.get("attribute") if eav else None,
-                value=eav.get("value") if eav else None,
-                valid=True,
             )
-
-        # Re-upsert overridden points with valid=False so Search can filter them
-        for old_unit in overridden_units:
-            old_vec = qdrant_store.client.retrieve(
-                collection_name=qdrant_store.collection,
-                ids=[old_unit.id],
-                with_vectors=True,
-            )
-            if old_vec:
-                qdrant_store.upsert(
-                    user_id=old_unit.user_id,
-                    session_id=old_unit.session_id,
-                    content=old_unit.content,
-                    vector=old_vec[0].vector,
-                    point_id=old_unit.id,
-                    created_at=old_unit.created_at,
-                    unit_type=old_unit.unit_type,
-                    source_ts=old_unit.source_ts,
-                    source_request_id=old_unit.source_request_id,
-                    entity=old_unit.entity,
-                    attribute=old_unit.attribute,
-                    value=old_unit.value,
-                    valid=False,
-                )
 
         db.commit()
 
@@ -623,15 +397,11 @@ def search_memory(request: SearchRequest) -> SearchResponse:
     for c in candidates:
         kw = _keyword_score(plain_query, c.get("content", ""))
         rec = _recency_score(c.get("source_ts"), latest_ts)
-        base_score = (
+        c["hybrid_score"] = (
             settings.dense_weight * c.get("dense_norm", 0.0)
             + settings.keyword_weight * kw
             + settings.recency_weight * rec
         )
-        # Validity penalty: superseded facts are heavily penalized so current-state facts rank higher.
-        valid = c.get("valid", True)
-        validity_multiplier = 1.0 if valid else 0.3
-        c["hybrid_score"] = base_score * validity_multiplier
 
     candidates.sort(key=lambda c: c["hybrid_score"], reverse=True)
     recall_candidates = candidates[: recall]
@@ -662,15 +432,6 @@ def search_memory(request: SearchRequest) -> SearchResponse:
         ordered = recall_candidates
         for c in ordered:
             c["score"] = c["hybrid_score"]
-
-    # Apply post-rerank validity penalty so superseded facts drop below current facts.
-    for c in ordered:
-        valid = c.get("valid", True)
-        if not valid:
-            c["score"] = c.get("score", 0.0) * 0.2
-
-    # Re-sort after validity penalty
-    ordered.sort(key=lambda c: c.get("score", 0.0), reverse=True)
 
     # Deduplicate near-duplicate contents before returning top_k.
     # ordered is already ranked by relevance, so we keep the first (best) occurrence.
