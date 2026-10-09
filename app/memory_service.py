@@ -426,14 +426,31 @@ def _create_edges(db, new_unit: MemoryUnit, relations: List[dict]):
         db.add(edge)
 
 
+def _value_skeleton(content: str, value: Optional[str]) -> str:
+    """Blank out the attribute value so two updates of the same slot compare equal.
+
+    "用户居住在北京" (value 北京) and "用户居住在上海" (value 上海) both become
+    "用户居住在§". If the value is only a paraphrase and not literally present in
+    the content, the content is returned unchanged, which keeps the guard strict.
+    """
+    if not value:
+        return content or ""
+    text = content or ""
+    v = str(value).strip()
+    if v and v in text:
+        return text.replace(v, "§")
+    return text
+
+
 def _apply_supersession(db, new_unit: MemoryUnit) -> List[str]:
     """Mark older same-attribute units as superseded and mirror it into Qdrant.
 
     Supersession is decided purely from the structured fields of the units, never
     from the LLM relation direction: an *event* unit such as "用户上个月搬到上海"
     must not be allowed to supersede the *state* unit it gives rise to. A unit can
-    only supersede another when it is itself a state fact (attribute + value) and
-    the older unit holds a different value for the same attribute.
+    only supersede another when it is itself a state fact (attribute + value), the
+    older unit holds a different value for the same attribute, and the two facts
+    are structurally the same apart from that value.
 
     The old units are kept (append-only audit trail) but flagged so that Search
     can softly demote them. Returns the list of superseded unit ids.
@@ -454,11 +471,21 @@ def _apply_supersession(db, new_unit: MemoryUnit) -> List[str]:
 
     superseded_ids: List[str] = []
     new_value_norm = str(value).strip().lower()
+    new_skeleton = _value_skeleton(new_unit.content, new_unit.value)
     for old in candidates:
         if old.value is None:
             continue
         if str(old.value).strip().lower() == new_value_norm:
             continue  # same value: a duplicate, not an update
+        # Structural guard: only true "same slot, new value" pairs qualify. This
+        # rejects loose attribute labels such as 情感价值 shared by two unrelated
+        # objects (a necklace and a bowl), which must not demote each other.
+        old_skeleton = _value_skeleton(old.content, old.value)
+        if (
+            _text_similarity(old_skeleton, new_skeleton)
+            < settings.supersession_min_skeleton_similarity
+        ):
+            continue
         # Never let an older fact overwrite a newer one (out-of-order Add).
         if (
             new_unit.source_ts is not None

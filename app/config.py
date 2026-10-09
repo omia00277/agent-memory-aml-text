@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # Direction A: soft demotion factor for facts superseded by a newer value.
     # Kept >0 so the audit trail stays retrievable (no hard filtering).
     superseded_score_penalty: float = 0.5
+    # Direction A guard: a newer fact may only supersede an older one when their
+    # contents are structurally the same after substituting the value
+    # ("用户居住在北京" vs "用户居住在上海" -> "用户居住在§"). This stops loose LLM
+    # attribute labels (e.g. 情感价值 applied to two unrelated objects) from
+    # creating false state updates.
+    supersession_min_skeleton_similarity: float = 0.5
 
     # Hybrid retrieval weights
     dense_weight: float = 0.50
