@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     structured_recall_limit: int = 20
     equivalent_similarity_threshold: float = 0.92
 
+    # Direction A: soft demotion factor for facts superseded by a newer value.
+    # Kept >0 so the audit trail stays retrievable (no hard filtering).
+    superseded_score_penalty: float = 0.5
+
     # Hybrid retrieval weights
     dense_weight: float = 0.50
     keyword_weight: float = 0.30

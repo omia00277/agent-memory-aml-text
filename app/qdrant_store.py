@@ -65,6 +65,7 @@ class QdrantMemoryStore:
         attribute: Optional[str] = None,
         value: Optional[str] = None,
         entities: Optional[List[str]] = None,
+        superseded: bool = False,
     ) -> str:
         point_id = point_id or str(uuid.uuid4())
         created_at = created_at or datetime.now(timezone.utc)
@@ -74,6 +75,7 @@ class QdrantMemoryStore:
             "content": content,
             "unit_type": unit_type,
             "created_at": created_at.isoformat(),
+            "superseded": superseded,
         }
         if source_ts is not None:
             payload["source_ts"] = source_ts
@@ -151,6 +153,17 @@ class QdrantMemoryStore:
         )
         return [self._point_to_dict(point) for point in response.points]
 
+    def mark_superseded(self, point_id: str) -> None:
+        """Flag an existing point as superseded without rewriting its vector.
+
+        Uses a partial payload update so the audit trail and embedding are kept.
+        """
+        self.client.set_payload(
+            collection_name=self.collection,
+            payload={"superseded": True},
+            points=[point_id],
+        )
+
     def _point_to_dict(self, point) -> dict:
         return {
             "id": str(point.id),
@@ -164,6 +177,7 @@ class QdrantMemoryStore:
             "attribute": point.payload.get("attribute"),
             "value": point.payload.get("value"),
             "entities": point.payload.get("entities", []),
+            "superseded": bool(point.payload.get("superseded", False)),
         }
 
 
