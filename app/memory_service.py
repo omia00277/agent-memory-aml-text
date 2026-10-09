@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Union
 
 from app.config import settings
-from app.consolidator import _split_sentences, consolidate
+from app.consolidator import _split_sentences, consolidate, extract_state_facts
 from app.database import MemoryEdge, MemoryUnit, RawChunk, SessionLocal
 from app.qdrant_store import qdrant_store
 from app.relations import RelationType, llm_classify_relations, rule_classify_relation
@@ -543,6 +543,18 @@ def add_memory(request: AddRequest) -> AddResponse:
 
         # Normalize structured facts and infer missing attribute/value/entities.
         fact_dicts = [_normalize_fact(f, source_ts) for f in consolidated]
+
+        # State tracking uses its own narrow LLM call rather than riding on the
+        # consolidation prompt: mixing them made the model drop the new state fact
+        # whenever the chunk also contained another state (reproducible at temp 0).
+        state_facts = [
+            _normalize_fact(f, source_ts) for f in extract_state_facts(text)
+        ]
+        for sf_fact in state_facts:
+            sf_fact["fact_type"] = "personal_state"
+        fact_dicts = fact_dicts + state_facts
+
+        # Regex fallback fills in attribute/value for facts the LLM left unstructured.
         fact_dicts = [_infer_attribute_value(f) for f in fact_dicts]
 
         # Add raw sentences as fallback units to preserve original details

@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # Memory consolidation
     enable_llm_consolidation: bool = True
     llm_consolidation_max_tokens: int = 1024
+    # Dedicated narrow call that extracts current single-valued property values.
+    enable_llm_state_extraction: bool = True
 
     # Cross-message association / relation extraction
     enable_relation_classification: bool = True

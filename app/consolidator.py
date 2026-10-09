@@ -17,26 +17,34 @@ SYSTEM_PROMPT = (
     "2. 对同一话题，既要有概括性事实，也要有具体细节事实。\n"
     "3. 【粒度优先】宁可多输出几条，也不要把多条独立信息合并成一条。\n"
     "4. 每条记忆必须能脱离上下文被独立理解。\n"
-    "5. 【状态句必须结构化】只要句子在陈述「某人/某物的某个属性当前的值」，"
-    "就必须填 attribute 和 value。常见属性如：居住地、手机号、职业、年龄、姓名、学历、婚姻状况。"
-    "例如 \"用户居住在北京\" 必须输出为 "
-    "{\"content\": \"用户居住在北京\", \"fact_type\": \"personal_state\", "
-    "\"attribute\": \"居住地\", \"value\": \"北京\"}。"
-    "非状态句（事件、感受、经历、观点）不要填 attribute。\n"
-    "6. 【变更必须产出新状态】当用户报告变更（搬家、换工作、改手机号等），"
-    "除原有事实外，必须额外输出一条独立的「变更后的当前状态」事实，同样填写 attribute 和 value。\n"
-    "7. 只输出 JSON 数组，数组元素为对象。不要输出解释、序号或 markdown。\n\n"
-    "字段：content 必填；fact_type / attribute / value / entities 可选"
-    "（状态句必须填 attribute 和 value）。\n\n"
-    "示例 1：\n"
+    "5. 只输出 JSON 数组，数组元素为对象，形如 {\"content\": \"...\"}；"
+    "可选字段 entities 列出涉及的实体词。不要输出解释、序号或 markdown。\n\n"
+    "示例：\n"
     "输入：user: 我上周六和朋友去中央公园野餐，带了草莓。\n"
     "输出：[{\"content\": \"用户上周六和朋友去中央公园野餐\"}, "
-    "{\"content\": \"用户野餐时带了草莓\"}]\n\n"
+    "{\"content\": \"用户野餐时带了草莓\"}]"
+)
+
+# State extraction is deliberately a separate, narrow LLM task. Putting it inside
+# SYSTEM_PROMPT made the model trade fact granularity for structured fields, and
+# worse, it silently skipped the state fact when the chunk also contained another
+# state (e.g. a move plus a phone number) — reproducible at temperature 0.
+STATE_PROMPT = (
+    "你只做一件事：从对话中抽取「单值属性的最新取值」。\n\n"
+    "单值属性＝同一时刻只能有一个取值的东西，例如：居住地、手机号、职业、年龄、姓名、"
+    "学历、婚姻状况、体重、邮箱、公司。\n"
+    "【不要】抽取观点、感受、情绪、经历、活动、兴趣、爱好、艺术作品、人际关系——"
+    "它们可以同时存在多个，不是单值属性。\n"
+    "如果用户提到变更（搬家、换工作、改手机号等），请推断出变更后的最新取值。\n\n"
+    "只输出 JSON 数组，元素形如 "
+    "{\"attribute\": \"居住地\", \"value\": \"上海\", \"content\": \"用户居住在上海\"}。\n"
+    "没有任何单值属性时输出 []。不要输出解释或 markdown。\n\n"
+    "示例 1：\n"
+    "输入：user: 我上个月搬到上海了。\n"
+    "输出：[{\"attribute\": \"居住地\", \"value\": \"上海\", \"content\": \"用户居住在上海\"}]\n\n"
     "示例 2：\n"
-    "输入：user: 我搬到上海了，现在住浦东。\n"
-    "输出：[{\"content\": \"用户搬到上海\"}, "
-    "{\"content\": \"用户居住在上海浦东\", \"fact_type\": \"personal_state\", "
-    "\"attribute\": \"居住地\", \"value\": \"上海浦东\", \"entities\": [\"用户\", \"上海浦东\"]}]"
+    "输入：user: 我上周去公园野餐，很开心。\n"
+    "输出：[]"
 )
 
 
@@ -142,3 +150,69 @@ def consolidate(messages_text: str) -> List[dict]:
     except Exception as e:
         logger.warning(f"Consolidation LLM failed ({e}); using sentence fallback.")
     return [{"content": s} for s in _split_sentences(messages_text)]
+
+
+def extract_state_facts(messages_text: str) -> List[dict]:
+    """Extract current single-valued property values as their own memory units.
+
+    This is a narrow, separate LLM task (see STATE_PROMPT) so that state tracking
+    does not compete with fact consolidation for the model's attention.
+
+    Returns a list of dicts with content/attribute/value/fact_type. On any failure
+    it returns an empty list; the caller keeps its regex fallback for such cases.
+    """
+    if not settings.enable_llm_state_extraction:
+        return []
+
+    prompt = f"对话内容：\n\n{messages_text}"
+    try:
+        raw = sf_client.chat(
+            [
+                {"role": "system", "content": STATE_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        states = _parse_state_output(raw)
+        return states
+    except Exception as e:
+        logger.warning(f"State extraction failed ({e}); continuing without it.")
+        return []
+
+
+def _parse_state_output(raw: str) -> List[dict]:
+    """Parse the narrow state-extraction output into fact dicts."""
+    if not raw:
+        return []
+    text = raw.strip()
+    fence = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end <= start:
+            return []
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+
+    results = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        attribute = item.get("attribute")
+        value = item.get("value")
+        content = item.get("content")
+        if not attribute or value is None or not content:
+            continue
+        results.append({
+            "content": str(content).strip(),
+            "fact_type": "personal_state",
+            "attribute": str(attribute).strip(),
+            "value": str(value).strip(),
+        })
+    return results
