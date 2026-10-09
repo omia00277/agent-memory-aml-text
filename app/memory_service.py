@@ -663,6 +663,15 @@ def search_memory(request: SearchRequest) -> SearchResponse:
         for c in ordered:
             c["score"] = c["hybrid_score"]
 
+    # Apply post-rerank validity penalty so superseded facts drop below current facts.
+    for c in ordered:
+        valid = c.get("valid", True)
+        if not valid:
+            c["score"] = c.get("score", 0.0) * 0.2
+
+    # Re-sort after validity penalty
+    ordered.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+
     # Deduplicate near-duplicate contents before returning top_k.
     # ordered is already ranked by relevance, so we keep the first (best) occurrence.
     deduped = _deduplicate_results(ordered)
