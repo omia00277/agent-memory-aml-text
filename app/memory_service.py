@@ -478,14 +478,17 @@ def _apply_supersession(db, new_unit: MemoryUnit) -> List[str]:
         if str(old.value).strip().lower() == new_value_norm:
             continue  # same value: a duplicate, not an update
         # Structural guard: only true "same slot, new value" pairs qualify. This
-        # rejects loose attribute labels such as 情感价值 shared by two unrelated
-        # objects (a necklace and a bowl), which must not demote each other.
-        old_skeleton = _value_skeleton(old.content, old.value)
-        if (
-            _text_similarity(old_skeleton, new_skeleton)
-            < settings.supersession_min_skeleton_similarity
-        ):
-            continue
+        # rejects loose LLM attribute labels such as 情感价值 shared by two
+        # unrelated objects (a necklace and a bowl). Raw sentences are exempt:
+        # their attributes come from the precise regex fallback, and their wording
+        # legitimately differs from the consolidated fact (including cross-language).
+        if old.unit_type != "raw":
+            old_skeleton = _value_skeleton(old.content, old.value)
+            if (
+                _text_similarity(old_skeleton, new_skeleton)
+                < settings.supersession_min_skeleton_similarity
+            ):
+                continue
         # Never let an older fact overwrite a newer one (out-of-order Add).
         if (
             new_unit.source_ts is not None
@@ -582,8 +585,13 @@ def add_memory(request: AddRequest) -> AddResponse:
 
             # Sort by informativeness and keep only the top N per chunk
             raw_candidates.sort(key=lambda x: x[0], reverse=True)
+            # Raw sentences get the same attribute fallback as facts: a raw copy of
+            # an outdated value ("I live in Beijing.") must be superseded too,
+            # otherwise it stays unpenalised and can outrank the new state.
             raw_sentence_dicts = [
-                _normalize_fact({"content": s, "fact_type": "raw"}, source_ts)
+                _infer_attribute_value(
+                    _normalize_fact({"content": s, "fact_type": "raw"}, source_ts)
+                )
                 for _, s in raw_candidates[: settings.raw_fallback_per_chunk]
             ]
 
