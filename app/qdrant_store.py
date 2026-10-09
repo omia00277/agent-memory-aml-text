@@ -12,6 +12,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
 )
 
 from app.config import settings
@@ -60,6 +61,10 @@ class QdrantMemoryStore:
         unit_type: str = "fact",
         source_ts: Optional[int] = None,
         source_request_id: Optional[str] = None,
+        fact_type: Optional[str] = None,
+        attribute: Optional[str] = None,
+        value: Optional[str] = None,
+        entities: Optional[List[str]] = None,
     ) -> str:
         point_id = point_id or str(uuid.uuid4())
         created_at = created_at or datetime.now(timezone.utc)
@@ -74,6 +79,14 @@ class QdrantMemoryStore:
             payload["source_ts"] = source_ts
         if source_request_id is not None:
             payload["source_request_id"] = source_request_id
+        if fact_type is not None:
+            payload["fact_type"] = fact_type
+        if attribute is not None:
+            payload["attribute"] = attribute
+        if value is not None:
+            payload["value"] = value
+        if entities is not None:
+            payload["entities"] = entities
         self.client.upsert(
             collection_name=self.collection,
             points=[
@@ -108,18 +121,50 @@ class QdrantMemoryStore:
             limit=limit,
             with_payload=True,
         )
-        return [
-            {
-                "id": str(point.id),
-                "content": point.payload.get("content"),
-                "score": point.score,
-                "created_at": point.payload.get("created_at"),
-                "unit_type": point.payload.get("unit_type", "fact"),
-                "source_ts": point.payload.get("source_ts"),
-                "source_request_id": point.payload.get("source_request_id"),
-            }
-            for point in response.points
+        return [self._point_to_dict(point) for point in response.points]
+
+    def search_by_entities(
+        self,
+        user_id: str,
+        entities: List[str],
+        query_vector: Optional[List[float]] = None,
+        top_k: int = 20,
+    ) -> List[dict]:
+        """Retrieve points whose payload entities overlap with the given entities.
+
+        If query_vector is provided, results are ranked by vector similarity;
+        otherwise a scroll-like keyword match is used (Qdrant local mode fallbacks
+        to payload filtering).
+        """
+        if not entities:
+            return []
+        must_conditions = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="entities", match=MatchAny(any=entities)),
         ]
+        response = self.client.query_points(
+            collection_name=self.collection,
+            query=query_vector,
+            query_filter=Filter(must=must_conditions),
+            limit=top_k,
+            with_payload=True,
+        )
+        return [self._point_to_dict(point) for point in response.points]
+
+    def _point_to_dict(self, point) -> dict:
+        return {
+            "id": str(point.id),
+            "content": point.payload.get("content"),
+            "score": point.score,
+            "created_at": point.payload.get("created_at"),
+            "unit_type": point.payload.get("unit_type", "fact"),
+            "source_ts": point.payload.get("source_ts"),
+            "source_request_id": point.payload.get("source_request_id"),
+            "fact_type": point.payload.get("fact_type"),
+            "attribute": point.payload.get("attribute"),
+            "value": point.payload.get("value"),
+            "entities": point.payload.get("entities", []),
+        }
 
 
 qdrant_store = QdrantMemoryStore()

@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     enable_llm_consolidation: bool = True
     llm_consolidation_max_tokens: int = 1024
 
+    # Cross-message association / relation extraction
+    enable_relation_classification: bool = True
+    relation_classification_batch_size: int = 10
+    relation_confidence_threshold: int = 70
+    related_candidates_max: int = 15
+    dense_recall_top_k: int = 20
+    keyword_recall_top_k: int = 20
+    structured_recall_limit: int = 20
+    equivalent_similarity_threshold: float = 0.92
+
     # Hybrid retrieval weights
     dense_weight: float = 0.50
     keyword_weight: float = 0.30

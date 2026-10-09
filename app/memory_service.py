@@ -6,8 +6,9 @@ from typing import List, Optional, Union
 
 from app.config import settings
 from app.consolidator import _split_sentences, consolidate
-from app.database import MemoryUnit, RawChunk, SessionLocal
+from app.database import CurrentState, MemoryEdge, MemoryUnit, RawChunk, SessionLocal
 from app.qdrant_store import qdrant_store
+from app.relations import RelationType, llm_classify_relations, rule_classify_relation
 from app.schemas import (
     AddRequest,
     AddResponse,
@@ -253,6 +254,304 @@ def _deduplicate_results(
     return selected
 
 
+# ---------------------------------------------------------------------------
+# Structured fact helpers
+# ---------------------------------------------------------------------------
+
+_ENTITY_ATTR_PATTERNS = [
+    # 居住地 - Chinese
+    (r"(?:住|居住|搬到|生活在|工作在)\s*(?:在|到)?\s*([^，。,.；;！!？?]+?)(?:\s*(?:附近|旁边|区|市|省|国|里|那里))?\s*[，。,.；;！!？?]", "居住地"),
+    # 居住地 - English
+    (r"(?:live\s+in|lived\s+in|moved\s+(?:to|in)|live\s+at|located\s+in)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "居住地"),
+    # 手机号 - Chinese
+    (r"(?:手机|电话|联系方式)\s*(?:号码|是|为)?\s*[:：]?\s*([\d\-]{7,})", "手机号"),
+    # 手机号 - English
+    (r"(?:phone|mobile|cell)\s*(?:number|is)?\s*[:：]?\s*([\d\-\+\(\)\s]{7,})", "手机号"),
+    # 工作 - Chinese
+    (r"(?:工作|职业|职位|是一名|做)\s*(?:是|为|的)?\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "工作"),
+    # 工作 - English
+    (r"(?:work\s+as|job\s+is|work\s+at|works\s+as|am\s+a|is\s+a)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "工作"),
+    # 年龄 - Chinese
+    (r"(\d{1,3})\s*(?:岁|years?\s*old)", "年龄"),
+    # 年龄 - English
+    (r"(?:age|i am|i'm)\s+(\d{1,3})\s*(?:years?\s*old)?", "年龄"),
+    # 名字 - Chinese
+    (r"(?:叫|姓名|名字是)\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "姓名"),
+    # 名字 - English
+    (r"(?:my\s+name\s+is|i\s+am|i'm)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "姓名"),
+]
+
+
+def _extract_entities_from_text(text: str) -> List[str]:
+    """Extract simple entity mentions from raw text."""
+    import re
+    entities = {"用户"}
+    # Named places (simple heuristic)
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,}(?:市|省|国|区|县|镇|村)", text):
+        entities.add(m.group(0))
+    for m in re.finditer(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*", text):
+        entities.add(m.group(0))
+    return list(entities)
+
+
+def _infer_attribute_value(fact: dict) -> dict:
+    """Infer attribute/value for facts that LLM didn't structure."""
+    import re
+    content = fact.get("content", "")
+    if fact.get("attribute") and fact.get("value"):
+        return fact
+    for pattern, attr in _ENTITY_ATTR_PATTERNS:
+        m = re.search(pattern, content)
+        if m:
+            fact = dict(fact)
+            fact["attribute"] = attr
+            fact["value"] = m.group(1).strip()
+            break
+    if not fact.get("entities"):
+        fact["entities"] = _extract_entities_from_text(content)
+    return fact
+
+
+def _normalize_fact(fact: dict, source_ts: Optional[int]) -> dict:
+    """Ensure a fact dict has all expected keys and normalized values."""
+    normalized = {
+        "content": str(fact.get("content", "")).strip(),
+        "fact_type": fact.get("fact_type") or "general_fact",
+        "attribute": fact.get("attribute") or None,
+        "value": fact.get("value") or None,
+        "entities": fact.get("entities") or _extract_entities_from_text(fact.get("content", "")),
+        "source_ts": source_ts,
+    }
+    if isinstance(normalized["entities"], str):
+        normalized["entities"] = [normalized["entities"]]
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Cross-message association helpers
+# ---------------------------------------------------------------------------
+
+def _retrieve_related_units(
+    db, new_fact: dict, user_id: str, vector: List[float]
+) -> List[MemoryUnit]:
+    """Retrieve candidate related memory units using multiple strategies."""
+    attribute = new_fact.get("attribute")
+    entities = new_fact.get("entities") or []
+
+    # 1. Structured match: same attribute or overlapping entities
+    structured_query = db.query(MemoryUnit).filter(MemoryUnit.user_id == user_id)
+    conditions = []
+    if attribute:
+        conditions.append(MemoryUnit.attribute == attribute)
+    if entities:
+        # SQLite JSON array matching is limited; use content LIKE for entities
+        for e in entities:
+            conditions.append(MemoryUnit.content.ilike(f"%{e}%"))
+    if conditions:
+        from sqlalchemy import or_
+        structured_query = structured_query.filter(or_(*conditions))
+    structured_query = structured_query.order_by(MemoryUnit.source_ts.desc()).limit(settings.structured_recall_limit)
+    structured = structured_query.all()
+
+    # 2. Dense semantic retrieval
+    dense = qdrant_store.search(
+        query_vector=vector,
+        user_id=user_id,
+        top_k=settings.dense_recall_top_k,
+    )
+
+    # 3. Entity keyword retrieval
+    keyword = []
+    if entities:
+        keyword = qdrant_store.search_by_entities(
+            user_id=user_id,
+            entities=entities,
+            query_vector=vector,
+            top_k=settings.keyword_recall_top_k,
+        )
+
+    # Merge and deduplicate by unit id
+    seen_ids = set()
+    merged: List[MemoryUnit] = []
+
+    # Structured matches are highest priority
+    for unit in structured:
+        if unit.id not in seen_ids:
+            seen_ids.add(unit.id)
+            merged.append(unit)
+
+    # Then dense and keyword by original order (already ranked)
+    for cand in dense + keyword:
+        uid = cand.get("id")
+        if uid and uid not in seen_ids:
+            unit = db.query(MemoryUnit).filter(MemoryUnit.id == uid).first()
+            if unit:
+                seen_ids.add(uid)
+                merged.append(unit)
+
+    return structured, merged
+
+
+def _select_candidates_for_classification(
+    structured: List[MemoryUnit],
+    merged: List[MemoryUnit],
+) -> List[MemoryUnit]:
+    """Select final candidates for relation classification.
+
+    Structured matches are always included; remaining slots are filled from the
+    merged ordered list up to related_candidates_max.
+    """
+    structured_ids = {u.id for u in structured}
+    must = [u for u in merged if u.id in structured_ids]
+    others = [u for u in merged if u.id not in structured_ids]
+    max_total = settings.related_candidates_max
+    remaining_slots = max(0, max_total - len(must))
+    return must + others[:remaining_slots]
+
+
+def _create_edges(db, new_unit: MemoryUnit, relations: List[dict]):
+    """Persist classified relations as memory edges."""
+    for rel in relations:
+        edge = MemoryEdge(
+            source_unit_id=new_unit.id,
+            target_unit_id=rel["target_unit_id"],
+            relation_type=rel["relation_type"],
+            confidence=rel.get("confidence", 70),
+        )
+        db.add(edge)
+
+
+def _update_current_state(db, user_id: str, new_unit: MemoryUnit, new_fact: dict):
+    """Maintain the current-state table for personal_state facts."""
+    attribute = new_fact.get("attribute")
+    value = new_fact.get("value")
+    entities = new_fact.get("entities") or []
+    if not attribute or value is None:
+        return
+
+    # Default entity is "用户" if not specified
+    entity = "用户"
+    for e in entities:
+        if e and e != "用户":
+            # Use first non-user entity as primary if available, else keep "用户"
+            pass
+
+    existing = (
+        db.query(CurrentState)
+        .filter(CurrentState.user_id == user_id)
+        .filter(CurrentState.entity == entity)
+        .filter(CurrentState.attribute == attribute)
+        .first()
+    )
+
+    if existing:
+        if str(existing.current_value).lower().strip() != str(value).lower().strip():
+            existing.previous_value = existing.current_value
+            existing.current_value = str(value)
+            existing.current_unit_id = new_unit.id
+            existing.updated_at = new_fact.get("source_ts") or new_unit.source_ts or 0
+            existing.proof_count += 1
+    else:
+        state = CurrentState(
+            user_id=user_id,
+            entity=entity,
+            attribute=attribute,
+            current_value=str(value),
+            current_unit_id=new_unit.id,
+            updated_at=new_fact.get("source_ts") or new_unit.source_ts or 0,
+            proof_count=1,
+        )
+        db.add(state)
+
+
+# ---------------------------------------------------------------------------
+# Search helpers
+# ---------------------------------------------------------------------------
+
+_QUERY_TYPE_KEYWORDS = {
+    "personal_state": {
+        "now", "currently", "live", "live in", "phone", "number", "address",
+        "where", "what is your", "how old", "age", "work as", "job", "name",
+        "现在", "目前", "住", "居住", "手机号", "电话", "地址", "几岁", "多大", "工作", "职业", "名字",
+    },
+    "personal_preference": {
+        "like", "love", "prefer", "enjoy", "hate", "dislike", "favorite",
+        "喜欢", "爱", "偏好", "讨厌", "不喜欢", "最爱",
+    },
+    "causal": {
+        "why", "because", "reason", "cause", "lead to", "result in", "because of",
+        "为什么", "因为", "原因", "导致", "引起", "由于", "所以",
+    },
+    "temporal": {
+        "when", "last", "before", "after", "during", "year", "month", "day",
+        "什么时候", "去年", "之前", "之后", "期间", "去年", "今年", "明年",
+    },
+}
+
+# Map query keywords to state attributes for CurrentState lookup.
+_STATE_ATTRIBUTE_KEYWORDS = {
+    "居住地": ["live", "live in", "where", " reside", "located", "住", "居住", "住的地方", "在哪"],
+    "手机号": ["phone", "mobile", "cell", "number", "手机号", "电话", "联系方式"],
+    "工作": ["work", "job", "career", "occupation", "工作", "职业", "做什么"],
+    "年龄": ["age", "how old", "old", "年龄", "多大", "几岁"],
+    "姓名": ["name", "called", "叫什么", "名字", "姓名"],
+}
+
+
+def _infer_query_type(query: str) -> str:
+    """Infer the type of information the query is asking for."""
+    q = query.lower()
+    scores = {}
+    for qtype, keywords in _QUERY_TYPE_KEYWORDS.items():
+        scores[qtype] = sum(1 for kw in keywords if kw in q)
+    if not scores:
+        return "general"
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "general"
+
+
+def _match_state_attributes(query: str) -> List[str]:
+    """Return state attributes that the query might be asking about."""
+    q = query.lower()
+    matched = []
+    for attr, keywords in _STATE_ATTRIBUTE_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in q:
+                matched.append(attr)
+                break
+    return matched
+
+
+def _lookup_current_state(db, user_id: str, query: str) -> List[dict]:
+    """Look up current state records that may answer the query."""
+    matched_attrs = _match_state_attributes(query)
+    if not matched_attrs:
+        return []
+
+    states = (
+        db.query(CurrentState)
+        .filter(CurrentState.user_id == user_id)
+        .filter(CurrentState.attribute.in_(matched_attrs))
+        .all()
+    )
+    results = []
+    for s in states:
+        # Bilingual content to match both English and Chinese queries
+        content = f"用户{s.attribute}是{s.current_value}。The user's {s.attribute} is {s.current_value}."
+        results.append({
+            "id": s.current_unit_id,
+            "content": content,
+            "score": 1.0,
+            "source_ts": s.updated_at,
+            "unit_type": "fact",
+            "fact_type": "personal_state",
+            "attribute": s.attribute,
+            "value": s.current_value,
+            "entities": [s.entity],
+        })
+    return results
+
+
 def add_memory(request: AddRequest) -> AddResponse:
     """Synchronous add: persist chunk and consolidated units, then make them searchable."""
     db = SessionLocal()
@@ -286,72 +585,127 @@ def add_memory(request: AddRequest) -> AddResponse:
 
         consolidated = consolidate(text)
         if not consolidated:
-            consolidated = [text]
+            consolidated = [{"content": text}]
+
+        # Normalize structured facts and infer missing attribute/value/entities.
+        fact_dicts = [_normalize_fact(f, source_ts) for f in consolidated]
+        fact_dicts = [_infer_attribute_value(f) for f in fact_dicts]
 
         # Add raw sentences as fallback units to preserve original details
         # that LLM consolidation may drop or over-generalize.
-        raw_sentences = []
+        raw_sentence_dicts = []
         if settings.enable_raw_sentence_fallback:
             raw_candidates = []
+            consolidated_contents = [f.get("content", "") for f in fact_dicts]
             for s in _split_sentences(text):
                 # Skip conversational fillers and overly short sentences
                 if not _is_meaningful_raw_sentence(s):
                     continue
                 # Skip raw sentences already subsumed by a consolidated fact
-                if any(s in fact or fact in s for fact in consolidated):
+                if any(s in fact or fact in s for fact in consolidated_contents):
                     continue
                 # Skip near-duplicate of any consolidated fact
-                if consolidated and any(
+                if consolidated_contents and any(
                     _is_near_duplicate(s, fact, settings.search_dedup_threshold)
-                    for fact in consolidated
+                    for fact in consolidated_contents
                 ):
                     continue
-                score = _score_raw_sentence(s, consolidated)
+                score = _score_raw_sentence(s, consolidated_contents)
                 if score >= settings.raw_fallback_min_score:
                     raw_candidates.append((score, s))
 
             # Sort by informativeness and keep only the top N per chunk
             raw_candidates.sort(key=lambda x: x[0], reverse=True)
-            raw_sentences = [s for _, s in raw_candidates[: settings.raw_fallback_per_chunk]]
+            raw_sentence_dicts = [
+                _normalize_fact({"content": s, "fact_type": "raw"}, source_ts)
+                for _, s in raw_candidates[: settings.raw_fallback_per_chunk]
+            ]
 
         # Preserve order: facts first, raw fallbacks after; deduplicate exact strings
         seen = set()
-        unit_contents = []
-        unit_types = []
-        for content, unit_type in [(c, "fact") for c in consolidated] + [
-            (c, "raw") for c in raw_sentences
-        ]:
-            key = content.strip()
+        all_units: List[dict] = []
+        for fact in fact_dicts + raw_sentence_dicts:
+            key = fact["content"].strip()
             if key and key not in seen:
                 seen.add(key)
-                unit_contents.append(content)
-                unit_types.append(unit_type)
+                fact["unit_type"] = "fact" if fact in fact_dicts else "raw"
+                all_units.append(fact)
 
+        unit_contents = [u["content"] for u in all_units]
         vectors = sf_client.embed(unit_contents)
 
-        for idx, content in enumerate(unit_contents):
+        created_units: List[MemoryUnit] = []
+        for idx, fact in enumerate(all_units):
             unit = MemoryUnit(
                 user_id=request.user_id,
                 session_id=request.session_id,
                 source_request_id=request.request_id,
-                content=content,
-                unit_type=unit_types[idx],
-                source_ts=source_ts,
+                content=fact["content"],
+                unit_type=fact["unit_type"],
+                source_ts=fact.get("source_ts") or source_ts,
                 created_at=created_at,
+                fact_type=fact.get("fact_type"),
+                attribute=fact.get("attribute"),
+                value=fact.get("value"),
+                entities=fact.get("entities"),
             )
             db.add(unit)
             db.flush()
+            created_units.append(unit)
             qdrant_store.upsert(
                 user_id=request.user_id,
                 session_id=request.session_id,
-                content=content,
+                content=fact["content"],
                 vector=vectors[idx],
                 point_id=unit.id,
                 created_at=created_at,
-                unit_type=unit_types[idx],
-                source_ts=source_ts,
+                unit_type=fact["unit_type"],
+                source_ts=fact.get("source_ts") or source_ts,
                 source_request_id=request.request_id,
+                fact_type=fact.get("fact_type"),
+                attribute=fact.get("attribute"),
+                value=fact.get("value"),
+                entities=fact.get("entities"),
             )
+
+        # Cross-message association: link new units to existing memory.
+        for unit, fact in zip(created_units, all_units):
+            if unit.unit_type == "raw":
+                # Raw sentences are less reliable for structured relations;
+                # only link them via dense similarity if very close.
+                continue
+
+            vector = vectors[all_units.index(fact)]
+            structured, merged = _retrieve_related_units(db, fact, request.user_id, vector)
+            candidates = _select_candidates_for_classification(structured, merged)
+
+            # Rule-based classification first
+            relations = []
+            ambiguous = []
+            for cand in candidates:
+                # Skip self-comparison
+                if cand.id == unit.id:
+                    continue
+                rule_result = rule_classify_relation(fact, cand, dense_score=0.0)
+                if rule_result:
+                    rel_type, conf = rule_result
+                    relations.append({
+                        "target_unit_id": cand.id,
+                        "relation_type": rel_type,
+                        "confidence": conf,
+                    })
+                else:
+                    ambiguous.append(cand)
+
+            # LLM classification for ambiguous candidates
+            if ambiguous and settings.enable_relation_classification:
+                llm_relations = llm_classify_relations(unit.content, ambiguous)
+                relations.extend(llm_relations)
+
+            _create_edges(db, unit, relations)
+
+            # Maintain current-state table for any fact with attribute and value
+            _update_current_state(db, request.user_id, unit, fact)
 
         db.commit()
 
@@ -371,81 +725,101 @@ def add_memory(request: AddRequest) -> AddResponse:
 
 def search_memory(request: SearchRequest) -> SearchResponse:
     """Search within user scope, hybrid-score, rerank, and return top_k memories."""
-    query_text = _build_query_text(request.query, request.options)
+    db = SessionLocal()
+    try:
+        query_text = _build_query_text(request.query, request.options)
+        query_type = _infer_query_type(query_text)
 
-    query_vectors = sf_client.embed([query_text])
-    query_vector = query_vectors[0]
+        query_vectors = sf_client.embed([query_text])
+        query_vector = query_vectors[0]
 
-    recall = min(request.top_k * settings.dense_recall_multiplier, 1000)
-    candidates = qdrant_store.search(
-        query_vector=query_vector,
-        user_id=request.user_id,
-        top_k=request.top_k,
-        limit=recall,
-    )
+        # Boost current-state facts for personal_state queries.
+        state_candidates: List[dict] = []
+        if query_type == "personal_state":
+            state_candidates = _lookup_current_state(db, request.user_id, query_text)
 
-    if not candidates:
-        return SearchResponse(data=[])
-
-    latest_ts = max(
-        (c.get("source_ts") for c in candidates if c.get("source_ts") is not None),
-        default=None,
-    )
-    candidates = _normalize_dense_scores(candidates)
-
-    plain_query = _normalize_content(request.query)
-    for c in candidates:
-        kw = _keyword_score(plain_query, c.get("content", ""))
-        rec = _recency_score(c.get("source_ts"), latest_ts)
-        c["hybrid_score"] = (
-            settings.dense_weight * c.get("dense_norm", 0.0)
-            + settings.keyword_weight * kw
-            + settings.recency_weight * rec
+        recall = min(request.top_k * settings.dense_recall_multiplier, 1000)
+        candidates = qdrant_store.search(
+            query_vector=query_vector,
+            user_id=request.user_id,
+            top_k=request.top_k,
+            limit=recall,
         )
 
-    candidates.sort(key=lambda c: c["hybrid_score"], reverse=True)
-    recall_candidates = candidates[: recall]
+        # Merge state candidates with vector candidates, deduplicate by id
+        seen_ids = {c["id"] for c in state_candidates}
+        merged_candidates = list(state_candidates)
+        for c in candidates:
+            if c["id"] not in seen_ids:
+                merged_candidates.append(c)
 
-    documents = [c["content"] for c in recall_candidates]
-    rerank_results = sf_client.rerank(
-        query=query_text,
-        documents=documents,
-        top_n=request.top_k,
-    )
+        if not merged_candidates:
+            return SearchResponse(data=[])
 
-    if rerank_results:
-        rerank_scores = {r["index"]: r["relevance_score"] for r in rerank_results}
-        ordered = []
-        for r in rerank_results:
-            idx = r["index"]
-            if 0 <= idx < len(recall_candidates):
-                c = recall_candidates[idx]
-                c["score"] = r["relevance_score"]
-                ordered.append(c)
-        returned_idx = {r["index"] for r in rerank_results}
-        remaining = [
-            c for i, c in enumerate(recall_candidates) if i not in returned_idx
+        latest_ts = max(
+            (c.get("source_ts") for c in merged_candidates if c.get("source_ts") is not None),
+            default=None,
+        )
+        merged_candidates = _normalize_dense_scores(merged_candidates)
+
+        plain_query = _normalize_content(request.query)
+        for c in merged_candidates:
+            kw = _keyword_score(plain_query, c.get("content", ""))
+            rec = _recency_score(c.get("source_ts"), latest_ts)
+            base_score = (
+                settings.dense_weight * c.get("dense_norm", 0.0)
+                + settings.keyword_weight * kw
+                + settings.recency_weight * rec
+            )
+            # Boost state candidates for current-state queries
+            if query_type == "personal_state" and c.get("fact_type") == "personal_state":
+                base_score *= 1.5
+            c["hybrid_score"] = base_score
+
+        merged_candidates.sort(key=lambda c: c["hybrid_score"], reverse=True)
+        recall_candidates = merged_candidates[: recall]
+
+        documents = [c["content"] for c in recall_candidates]
+        rerank_results = sf_client.rerank(
+            query=query_text,
+            documents=documents,
+            top_n=request.top_k,
+        )
+
+        if rerank_results:
+            rerank_scores = {r["index"]: r["relevance_score"] for r in rerank_results}
+            ordered = []
+            for r in rerank_results:
+                idx = r["index"]
+                if 0 <= idx < len(recall_candidates):
+                    c = recall_candidates[idx]
+                    c["score"] = r["relevance_score"]
+                    ordered.append(c)
+            returned_idx = {r["index"] for r in rerank_results}
+            remaining = [
+                c for i, c in enumerate(recall_candidates) if i not in returned_idx
+            ]
+            remaining.sort(key=lambda c: c["hybrid_score"], reverse=True)
+            ordered.extend(remaining)
+        else:
+            ordered = recall_candidates
+            for c in ordered:
+                c["score"] = c["hybrid_score"]
+
+        # Deduplicate near-duplicate contents before returning top_k.
+        deduped = _deduplicate_results(ordered)
+        final = deduped[: request.top_k]
+
+        data = [
+            MemoryItem(
+                id=c["id"],
+                content=c["content"],
+                score=c.get("score"),
+                created_at=_ts_to_iso(c.get("source_ts")) or c.get("created_at"),
+            )
+            for c in final
         ]
-        remaining.sort(key=lambda c: c["hybrid_score"], reverse=True)
-        ordered.extend(remaining)
-    else:
-        ordered = recall_candidates
-        for c in ordered:
-            c["score"] = c["hybrid_score"]
 
-    # Deduplicate near-duplicate contents before returning top_k.
-    # ordered is already ranked by relevance, so we keep the first (best) occurrence.
-    deduped = _deduplicate_results(ordered)
-    final = deduped[: request.top_k]
-
-    data = [
-        MemoryItem(
-            id=c["id"],
-            content=c["content"],
-            score=c.get("score"),
-            created_at=_ts_to_iso(c.get("source_ts")) or c.get("created_at"),
-        )
-        for c in final
-    ]
-
-    return SearchResponse(data=data)
+        return SearchResponse(data=data)
+    finally:
+        db.close()
