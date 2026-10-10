@@ -191,16 +191,31 @@ def _assign_episode(db, fact: dict, vector: List[float], user_id: str, session_i
     if not candidates:
         recent = db.query(Episode).filter(Episode.user_id == user_id).order_by(Episode.updated_at.desc()).limit(settings.episode_candidate_limit).all()
         candidates = [e for e in recent if _keyword_score(fact["text"], f"{e.title} {e.summary}") > 0]
+    if not candidates:
+        return _create_episode(db, fact, user_id, session_id, source_id)
+    # Fast rule-based decision to avoid excessive LLM calls
+    scored = []
+    fact_lower = fact["text"].lower()
+    for ep in candidates:
+        sim = _text_similarity(fact_lower, f"{ep.title} {ep.summary}".lower())
+        scored.append((sim, ep))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_sim, best_ep = scored[0]
+    if best_sim >= 0.6:
+        return _update_episode(best_ep, fact["text"], source_id)
+    if best_sim <= 0.25 and len(candidates) >= 2:
+        return _create_episode(db, fact, user_id, session_id, source_id)
+    # Ambiguous: ask LLM
     episode_id = _event_decision(fact, candidates)
-    now = datetime.now(timezone.utc)
     if episode_id:
         episode = db.query(Episode).filter(Episode.id == episode_id, Episode.user_id == user_id).first()
         if episode:
-            episode.updated_at = now
-            episode.summary = f"{episode.summary}；{fact['text']}"[:4000]
-            if source_id and not episode.source_id:
-                episode.source_id = source_id
-            return episode
+            return _update_episode(episode, fact["text"], source_id)
+    return _create_episode(db, fact, user_id, session_id, source_id)
+
+
+def _create_episode(db, fact: dict, user_id: str, session_id: str, source_id: str) -> Episode:
+    now = datetime.now(timezone.utc)
     episode = Episode(
         user_id=user_id,
         session_id=session_id,
@@ -212,6 +227,16 @@ def _assign_episode(db, fact: dict, vector: List[float], user_id: str, session_i
     )
     db.add(episode)
     db.flush()
+    return episode
+
+
+def _update_episode(episode: Episode, fact_text: str, source_id: str) -> Episode:
+    now = datetime.now(timezone.utc)
+    episode.updated_at = now
+    if fact_text not in episode.summary:
+        episode.summary = f"{episode.summary}；{fact_text}"[:4000]
+    if source_id and not episode.source_id:
+        episode.source_id = source_id
     return episode
 
 
