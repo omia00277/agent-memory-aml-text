@@ -64,29 +64,6 @@ class MemoryUnit(Base):
     source_ts = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    # Structured fields extracted from the fact for cross-message association.
-    fact_type = Column(String(32), nullable=True)
-    attribute = Column(String(255), nullable=True, index=True)
-    value = Column(Text, nullable=True)
-    entities = Column(JSON, nullable=True)  # list of entity strings
-
-    # Direction A: when a later fact updates the same attribute, the older unit is
-    # kept (append-only audit trail) but flagged so Search can softly demote it.
-    superseded_by = Column(String(64), nullable=True, index=True)
-
-
-class MemoryEdge(Base):
-    """Relationships between memory units (updates, causes, equivalent, etc.)."""
-
-    __tablename__ = "memory_edges"
-
-    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
-    source_unit_id = Column(String(64), nullable=False, index=True)
-    target_unit_id = Column(String(64), nullable=False, index=True)
-    relation_type = Column(String(32), nullable=False, index=True)
-    confidence = Column(Integer, nullable=False, default=70)  # 0-100
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -98,31 +75,8 @@ def _migrate_sqlite():
     if not settings.database_url.startswith("sqlite"):
         return
     inspector = inspect(engine)
-
-    # raw_chunks migration
     if "raw_chunks" in inspector.get_table_names():
         existing = {c["name"] for c in inspector.get_columns("raw_chunks")}
         if "source_ts" not in existing:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE raw_chunks ADD COLUMN source_ts INTEGER"))
-
-    # memory_units migration
-    if "memory_units" in inspector.get_table_names():
-        existing = {c["name"] for c in inspector.get_columns("memory_units")}
-        new_columns = [
-            ("fact_type", "VARCHAR(32)"),
-            ("attribute", "VARCHAR(255)"),
-            ("value", "TEXT"),
-            ("entities", "JSON"),
-            ("superseded_by", "VARCHAR(64)"),
-        ]
-        for col_name, col_type in new_columns:
-            if col_name not in existing:
-                with engine.begin() as conn:
-                    conn.execute(text(f"ALTER TABLE memory_units ADD COLUMN {col_name} {col_type}"))
-
-    # The current_states table was replaced by MemoryUnit.superseded_by (Direction A).
-    with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS current_states"))
-
-    # memory_edges is created by Base.metadata.create_all

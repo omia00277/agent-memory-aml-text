@@ -5,10 +5,9 @@ from datetime import datetime, timezone
 from typing import List, Optional, Union
 
 from app.config import settings
-from app.consolidator import _split_sentences, consolidate, extract_state_facts
-from app.database import MemoryEdge, MemoryUnit, RawChunk, SessionLocal
+from app.consolidator import _split_sentences, consolidate
+from app.database import MemoryUnit, RawChunk, SessionLocal
 from app.qdrant_store import qdrant_store
-from app.relations import RelationType, llm_classify_relations, rule_classify_relation
 from app.schemas import (
     AddRequest,
     AddResponse,
@@ -254,261 +253,6 @@ def _deduplicate_results(
     return selected
 
 
-# ---------------------------------------------------------------------------
-# Structured fact helpers
-# ---------------------------------------------------------------------------
-
-_ENTITY_ATTR_PATTERNS = [
-    # NOTE: this regex set is a *fallback* used only when the LLM did not return
-    # structured fields. It deliberately matches only *state* phrasings (X lives
-    # in Y). Event phrasings such as "moved to X" are excluded on purpose: a move
-    # is an event, and turning it into "居住地=X" would let an event unit supersede
-    # a real state unit (see _apply_supersession).
-    # 居住地 - Chinese
-    (r"(?:住|居住|生活在)\s*(?:在|于)?\s*([^，。,.；;！!？?]+?)(?:\s*(?:附近|旁边|区|市|省|国|里|那里))?\s*[，。,.；;！!？?]", "居住地"),
-    # 居住地 - English
-    (r"(?:live\s+in|lived\s+in|reside\s+in|live\s+at|located\s+in)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "居住地"),
-    # 手机号 - Chinese
-    (r"(?:手机|电话|联系方式)\s*(?:号码|是|为)?\s*[:：]?\s*([\d\-]{7,})", "手机号"),
-    # 手机号 - English
-    (r"(?:phone|mobile|cell)\s*(?:number|is)?\s*[:：]?\s*([\d\-\+\(\)\s]{7,})", "手机号"),
-    # 工作 - Chinese
-    (r"(?:工作|职业|职位|是一名)\s*(?:是|为|的)?\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "工作"),
-    # 工作 - English
-    (r"(?:work\s+as|job\s+is|works\s+as|am\s+a|is\s+a)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "工作"),
-    # 年龄 - Chinese
-    (r"(\d{1,3})\s*(?:岁|years?\s*old)", "年龄"),
-    # 年龄 - English
-    (r"(?:age|i am|i'm)\s+(\d{1,3})\s*(?:years?\s*old)?", "年龄"),
-    # 名字 - Chinese
-    (r"(?:叫|姓名|名字是)\s*[:：]?\s*([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?])", "姓名"),
-    # 名字 - English
-    (r"(?:my\s+name\s+is|i\s+am|i'm)\s+([^，。,.；;！!？?]+?)(?:\s*[，。,.；;！!？?]|$)", "姓名"),
-]
-
-
-def _extract_entities_from_text(text: str) -> List[str]:
-    """Extract simple entity mentions from raw text."""
-    import re
-    entities = {"用户"}
-    # Named places (simple heuristic)
-    for m in re.finditer(r"[\u4e00-\u9fff]{2,}(?:市|省|国|区|县|镇|村)", text):
-        entities.add(m.group(0))
-    for m in re.finditer(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*", text):
-        entities.add(m.group(0))
-    return list(entities)
-
-
-def _infer_attribute_value(fact: dict) -> dict:
-    """Infer attribute/value for facts that LLM didn't structure."""
-    import re
-    content = fact.get("content", "")
-    if fact.get("attribute") and fact.get("value"):
-        return fact
-    for pattern, attr in _ENTITY_ATTR_PATTERNS:
-        m = re.search(pattern, content)
-        if m:
-            fact = dict(fact)
-            fact["attribute"] = attr
-            fact["value"] = m.group(1).strip()
-            break
-    if not fact.get("entities"):
-        fact["entities"] = _extract_entities_from_text(content)
-    return fact
-
-
-def _normalize_fact(fact: dict, source_ts: Optional[int]) -> dict:
-    """Ensure a fact dict has all expected keys and normalized values."""
-    normalized = {
-        "content": str(fact.get("content", "")).strip(),
-        "fact_type": fact.get("fact_type") or "general_fact",
-        "attribute": fact.get("attribute") or None,
-        "value": fact.get("value") or None,
-        "entities": fact.get("entities") or _extract_entities_from_text(fact.get("content", "")),
-        "source_ts": source_ts,
-    }
-    if isinstance(normalized["entities"], str):
-        normalized["entities"] = [normalized["entities"]]
-    return normalized
-
-
-# ---------------------------------------------------------------------------
-# Cross-message association helpers
-# ---------------------------------------------------------------------------
-
-def _retrieve_related_units(
-    db, new_fact: dict, user_id: str, vector: List[float]
-) -> List[MemoryUnit]:
-    """Retrieve candidate related memory units using multiple strategies."""
-    attribute = new_fact.get("attribute")
-    entities = new_fact.get("entities") or []
-
-    # 1. Structured match: same attribute or overlapping entities
-    structured_query = db.query(MemoryUnit).filter(MemoryUnit.user_id == user_id)
-    conditions = []
-    if attribute:
-        conditions.append(MemoryUnit.attribute == attribute)
-    if entities:
-        # SQLite JSON array matching is limited; use content LIKE for entities
-        for e in entities:
-            conditions.append(MemoryUnit.content.ilike(f"%{e}%"))
-    if conditions:
-        from sqlalchemy import or_
-        structured_query = structured_query.filter(or_(*conditions))
-    structured_query = structured_query.order_by(MemoryUnit.source_ts.desc()).limit(settings.structured_recall_limit)
-    structured = structured_query.all()
-
-    # 2. Dense semantic retrieval
-    dense = qdrant_store.search(
-        query_vector=vector,
-        user_id=user_id,
-        top_k=settings.dense_recall_top_k,
-    )
-
-    # 3. Entity keyword retrieval
-    keyword = []
-    if entities:
-        keyword = qdrant_store.search_by_entities(
-            user_id=user_id,
-            entities=entities,
-            query_vector=vector,
-            top_k=settings.keyword_recall_top_k,
-        )
-
-    # Merge and deduplicate by unit id
-    seen_ids = set()
-    merged: List[MemoryUnit] = []
-
-    # Structured matches are highest priority
-    for unit in structured:
-        if unit.id not in seen_ids:
-            seen_ids.add(unit.id)
-            merged.append(unit)
-
-    # Then dense and keyword by original order (already ranked)
-    for cand in dense + keyword:
-        uid = cand.get("id")
-        if uid and uid not in seen_ids:
-            unit = db.query(MemoryUnit).filter(MemoryUnit.id == uid).first()
-            if unit:
-                seen_ids.add(uid)
-                merged.append(unit)
-
-    return structured, merged
-
-
-def _select_candidates_for_classification(
-    structured: List[MemoryUnit],
-    merged: List[MemoryUnit],
-) -> List[MemoryUnit]:
-    """Select final candidates for relation classification.
-
-    Structured matches are always included; remaining slots are filled from the
-    merged ordered list up to related_candidates_max.
-    """
-    structured_ids = {u.id for u in structured}
-    must = [u for u in merged if u.id in structured_ids]
-    others = [u for u in merged if u.id not in structured_ids]
-    max_total = settings.related_candidates_max
-    remaining_slots = max(0, max_total - len(must))
-    return must + others[:remaining_slots]
-
-
-def _create_edges(db, new_unit: MemoryUnit, relations: List[dict]):
-    """Persist classified relations as memory edges."""
-    for rel in relations:
-        edge = MemoryEdge(
-            source_unit_id=new_unit.id,
-            target_unit_id=rel["target_unit_id"],
-            relation_type=rel["relation_type"],
-            confidence=rel.get("confidence", 70),
-        )
-        db.add(edge)
-
-
-def _value_skeleton(content: str, value: Optional[str]) -> str:
-    """Blank out the attribute value so two updates of the same slot compare equal.
-
-    "用户居住在北京" (value 北京) and "用户居住在上海" (value 上海) both become
-    "用户居住在§". If the value is only a paraphrase and not literally present in
-    the content, the content is returned unchanged, which keeps the guard strict.
-    """
-    if not value:
-        return content or ""
-    text = content or ""
-    v = str(value).strip()
-    if v and v in text:
-        return text.replace(v, "§")
-    return text
-
-
-def _apply_supersession(db, new_unit: MemoryUnit) -> List[str]:
-    """Mark older same-attribute units as superseded and mirror it into Qdrant.
-
-    Supersession is decided purely from the structured fields of the units, never
-    from the LLM relation direction: an *event* unit such as "用户上个月搬到上海"
-    must not be allowed to supersede the *state* unit it gives rise to. A unit can
-    only supersede another when it is itself a state fact (attribute + value), the
-    older unit holds a different value for the same attribute, and the two facts
-    are structurally the same apart from that value.
-
-    The old units are kept (append-only audit trail) but flagged so that Search
-    can softly demote them. Returns the list of superseded unit ids.
-    """
-    attribute = new_unit.attribute
-    value = new_unit.value
-    if not attribute or value is None or new_unit.unit_type != "fact":
-        return []
-
-    candidates = (
-        db.query(MemoryUnit)
-        .filter(MemoryUnit.user_id == new_unit.user_id)
-        .filter(MemoryUnit.attribute == attribute)
-        .filter(MemoryUnit.id != new_unit.id)
-        .filter(MemoryUnit.superseded_by.is_(None))
-        .all()
-    )
-
-    superseded_ids: List[str] = []
-    new_value_norm = str(value).strip().lower()
-    new_skeleton = _value_skeleton(new_unit.content, new_unit.value)
-    for old in candidates:
-        if old.value is None:
-            continue
-        if str(old.value).strip().lower() == new_value_norm:
-            continue  # same value: a duplicate, not an update
-        # Structural guard: only true "same slot, new value" pairs qualify. This
-        # rejects loose LLM attribute labels such as 情感价值 shared by two
-        # unrelated objects (a necklace and a bowl). Raw sentences are exempt:
-        # their attributes come from the precise regex fallback, and their wording
-        # legitimately differs from the consolidated fact (including cross-language).
-        if old.unit_type != "raw":
-            old_skeleton = _value_skeleton(old.content, old.value)
-            if (
-                _text_similarity(old_skeleton, new_skeleton)
-                < settings.supersession_min_skeleton_similarity
-            ):
-                continue
-        # Never let an older fact overwrite a newer one (out-of-order Add).
-        if (
-            new_unit.source_ts is not None
-            and old.source_ts is not None
-            and new_unit.source_ts < old.source_ts
-        ):
-            continue
-        old.superseded_by = new_unit.id
-        db.add(old)
-        superseded_ids.append(old.id)
-
-    # Mirror the flag into Qdrant payload so Search sees it without a DB join.
-    for unit_id in superseded_ids:
-        try:
-            qdrant_store.mark_superseded(unit_id)
-        except Exception as e:  # pragma: no cover - payload update is best-effort
-            logger.warning(f"Failed to mark {unit_id} superseded in Qdrant: {e}")
-    return superseded_ids
-
-
 def add_memory(request: AddRequest) -> AddResponse:
     """Synchronous add: persist chunk and consolidated units, then make them searchable."""
     db = SessionLocal()
@@ -542,144 +286,72 @@ def add_memory(request: AddRequest) -> AddResponse:
 
         consolidated = consolidate(text)
         if not consolidated:
-            consolidated = [{"content": text}]
-
-        # Normalize structured facts and infer missing attribute/value/entities.
-        fact_dicts = [_normalize_fact(f, source_ts) for f in consolidated]
-
-        # State tracking uses its own narrow LLM call rather than riding on the
-        # consolidation prompt: mixing them made the model drop the new state fact
-        # whenever the chunk also contained another state (reproducible at temp 0).
-        state_facts = [
-            _normalize_fact(f, source_ts) for f in extract_state_facts(text)
-        ]
-        for sf_fact in state_facts:
-            sf_fact["fact_type"] = "personal_state"
-        fact_dicts = fact_dicts + state_facts
-
-        # Regex fallback fills in attribute/value for facts the LLM left unstructured.
-        fact_dicts = [_infer_attribute_value(f) for f in fact_dicts]
+            consolidated = [text]
 
         # Add raw sentences as fallback units to preserve original details
         # that LLM consolidation may drop or over-generalize.
-        raw_sentence_dicts = []
+        raw_sentences = []
         if settings.enable_raw_sentence_fallback:
             raw_candidates = []
-            consolidated_contents = [f.get("content", "") for f in fact_dicts]
             for s in _split_sentences(text):
                 # Skip conversational fillers and overly short sentences
                 if not _is_meaningful_raw_sentence(s):
                     continue
                 # Skip raw sentences already subsumed by a consolidated fact
-                if any(s in fact or fact in s for fact in consolidated_contents):
+                if any(s in fact or fact in s for fact in consolidated):
                     continue
                 # Skip near-duplicate of any consolidated fact
-                if consolidated_contents and any(
+                if consolidated and any(
                     _is_near_duplicate(s, fact, settings.search_dedup_threshold)
-                    for fact in consolidated_contents
+                    for fact in consolidated
                 ):
                     continue
-                score = _score_raw_sentence(s, consolidated_contents)
+                score = _score_raw_sentence(s, consolidated)
                 if score >= settings.raw_fallback_min_score:
                     raw_candidates.append((score, s))
 
             # Sort by informativeness and keep only the top N per chunk
             raw_candidates.sort(key=lambda x: x[0], reverse=True)
-            # Raw sentences get the same attribute fallback as facts: a raw copy of
-            # an outdated value ("I live in Beijing.") must be superseded too,
-            # otherwise it stays unpenalised and can outrank the new state.
-            raw_sentence_dicts = [
-                _infer_attribute_value(
-                    _normalize_fact({"content": s, "fact_type": "raw"}, source_ts)
-                )
-                for _, s in raw_candidates[: settings.raw_fallback_per_chunk]
-            ]
+            raw_sentences = [s for _, s in raw_candidates[: settings.raw_fallback_per_chunk]]
 
         # Preserve order: facts first, raw fallbacks after; deduplicate exact strings
         seen = set()
-        all_units: List[dict] = []
-        for fact in fact_dicts + raw_sentence_dicts:
-            key = fact["content"].strip()
+        unit_contents = []
+        unit_types = []
+        for content, unit_type in [(c, "fact") for c in consolidated] + [
+            (c, "raw") for c in raw_sentences
+        ]:
+            key = content.strip()
             if key and key not in seen:
                 seen.add(key)
-                fact["unit_type"] = "fact" if fact in fact_dicts else "raw"
-                all_units.append(fact)
+                unit_contents.append(content)
+                unit_types.append(unit_type)
 
-        unit_contents = [u["content"] for u in all_units]
         vectors = sf_client.embed(unit_contents)
 
-        created_units: List[MemoryUnit] = []
-        for idx, fact in enumerate(all_units):
+        for idx, content in enumerate(unit_contents):
             unit = MemoryUnit(
                 user_id=request.user_id,
                 session_id=request.session_id,
                 source_request_id=request.request_id,
-                content=fact["content"],
-                unit_type=fact["unit_type"],
-                source_ts=fact.get("source_ts") or source_ts,
+                content=content,
+                unit_type=unit_types[idx],
+                source_ts=source_ts,
                 created_at=created_at,
-                fact_type=fact.get("fact_type"),
-                attribute=fact.get("attribute"),
-                value=fact.get("value"),
-                entities=fact.get("entities"),
             )
             db.add(unit)
             db.flush()
-            created_units.append(unit)
             qdrant_store.upsert(
                 user_id=request.user_id,
                 session_id=request.session_id,
-                content=fact["content"],
+                content=content,
                 vector=vectors[idx],
                 point_id=unit.id,
                 created_at=created_at,
-                unit_type=fact["unit_type"],
-                source_ts=fact.get("source_ts") or source_ts,
+                unit_type=unit_types[idx],
+                source_ts=source_ts,
                 source_request_id=request.request_id,
-                fact_type=fact.get("fact_type"),
-                attribute=fact.get("attribute"),
-                value=fact.get("value"),
-                entities=fact.get("entities"),
             )
-
-        # Cross-message association: link new units to existing memory.
-        for idx, (unit, fact) in enumerate(zip(created_units, all_units)):
-            if unit.unit_type == "raw":
-                # Raw sentences are less reliable for structured relations;
-                # they stay searchable but do not drive the association graph.
-                continue
-
-            structured, merged = _retrieve_related_units(
-                db, fact, request.user_id, vectors[idx]
-            )
-            candidates = _select_candidates_for_classification(structured, merged)
-
-            # Rule-based classification first; ambiguous cases go to the LLM.
-            relations = []
-            ambiguous = []
-            for cand in candidates:
-                if cand.id == unit.id:
-                    continue
-                rule_result = rule_classify_relation(fact, cand)
-                if rule_result:
-                    rel_type, conf = rule_result
-                    relations.append({
-                        "target_unit_id": cand.id,
-                        "relation_type": rel_type,
-                        "confidence": conf,
-                    })
-                else:
-                    ambiguous.append(cand)
-
-            if ambiguous and settings.enable_relation_classification:
-                relations.extend(llm_classify_relations(unit.content, ambiguous))
-
-            _create_edges(db, unit, relations)
-
-            # Direction A: supersession is derived from the structured fields, not
-            # from the LLM relation direction. Old facts are kept but softly demoted,
-            # while the new fact is a real, first-class memory unit Search can retrieve.
-            _apply_supersession(db, unit)
 
         db.commit()
 
@@ -725,16 +397,11 @@ def search_memory(request: SearchRequest) -> SearchResponse:
     for c in candidates:
         kw = _keyword_score(plain_query, c.get("content", ""))
         rec = _recency_score(c.get("source_ts"), latest_ts)
-        base_score = (
+        c["hybrid_score"] = (
             settings.dense_weight * c.get("dense_norm", 0.0)
             + settings.keyword_weight * kw
             + settings.recency_weight * rec
         )
-        # Direction A: superseded facts are kept for audit but softly demoted so
-        # the newer, still-valid fact wins without any query-side attribute mapping.
-        if c.get("superseded"):
-            base_score *= settings.superseded_score_penalty
-        c["hybrid_score"] = base_score
 
     candidates.sort(key=lambda c: c["hybrid_score"], reverse=True)
     recall_candidates = candidates[: recall]
@@ -747,6 +414,7 @@ def search_memory(request: SearchRequest) -> SearchResponse:
     )
 
     if rerank_results:
+        rerank_scores = {r["index"]: r["relevance_score"] for r in rerank_results}
         ordered = []
         for r in rerank_results:
             idx = r["index"]
@@ -765,14 +433,8 @@ def search_memory(request: SearchRequest) -> SearchResponse:
         for c in ordered:
             c["score"] = c["hybrid_score"]
 
-    # Apply the demotion after reranking too, since the cross-encoder does not
-    # know about supersession and could otherwise lift a stale fact back up.
-    for c in ordered:
-        if c.get("superseded"):
-            c["score"] = c.get("score", 0.0) * settings.superseded_score_penalty
-    ordered.sort(key=lambda c: c.get("score", 0.0), reverse=True)
-
     # Deduplicate near-duplicate contents before returning top_k.
+    # ordered is already ranked by relevance, so we keep the first (best) occurrence.
     deduped = _deduplicate_results(ordered)
     final = deduped[: request.top_k]
 

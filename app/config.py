@@ -38,28 +38,6 @@ class Settings(BaseSettings):
     # Memory consolidation
     enable_llm_consolidation: bool = True
     llm_consolidation_max_tokens: int = 1024
-    # Dedicated narrow call that extracts current single-valued property values.
-    enable_llm_state_extraction: bool = True
-
-    # Cross-message association / relation extraction
-    enable_relation_classification: bool = True
-    relation_classification_batch_size: int = 10
-    relation_confidence_threshold: int = 70
-    related_candidates_max: int = 15
-    dense_recall_top_k: int = 20
-    keyword_recall_top_k: int = 20
-    structured_recall_limit: int = 20
-    equivalent_similarity_threshold: float = 0.92
-
-    # Direction A: soft demotion factor for facts superseded by a newer value.
-    # Kept >0 so the audit trail stays retrievable (no hard filtering).
-    superseded_score_penalty: float = 0.5
-    # Direction A guard: a newer fact may only supersede an older one when their
-    # contents are structurally the same after substituting the value
-    # ("用户居住在北京" vs "用户居住在上海" -> "用户居住在§"). This stops loose LLM
-    # attribute labels (e.g. 情感价值 applied to two unrelated objects) from
-    # creating false state updates.
-    supersession_min_skeleton_similarity: float = 0.5
 
     # Hybrid retrieval weights
     dense_weight: float = 0.50
