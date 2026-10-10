@@ -1,31 +1,27 @@
+import logging
 import os
 import uuid
-import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
     FieldCondition,
+    Filter,
     MatchValue,
+    PointStruct,
+    VectorParams,
 )
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-EMBEDDING_DIM = 1024  # BAAI/bge-m3 dense dimension
+EMBEDDING_DIM = 1024
 
 
 class QdrantMemoryStore:
-    def __init__(
-        self,
-        collection: str = settings.qdrant_collection,
-    ):
+    def __init__(self, collection: str = settings.qdrant_collection):
         self.collection = collection
         if settings.qdrant_url:
             logger.info(f"Connecting to remote Qdrant at {settings.qdrant_url}")
@@ -38,16 +34,11 @@ class QdrantMemoryStore:
 
     def _ensure_collection(self):
         collections = self.client.get_collections().collections
-        exists = any(c.name == self.collection for c in collections)
-        if not exists:
+        if not any(c.name == self.collection for c in collections):
             self.client.create_collection(
                 collection_name=self.collection,
-                vectors_config=VectorParams(
-                    size=EMBEDDING_DIM,
-                    distance=Distance.COSINE,
-                ),
+                vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
             )
-            logger.info(f"Created Qdrant collection: {self.collection}")
 
     def upsert(
         self,
@@ -60,6 +51,7 @@ class QdrantMemoryStore:
         unit_type: str = "fact",
         source_ts: Optional[int] = None,
         source_request_id: Optional[str] = None,
+        episode_id: Optional[str] = None,
     ) -> str:
         point_id = point_id or str(uuid.uuid4())
         created_at = created_at or datetime.now(timezone.utc)
@@ -74,15 +66,11 @@ class QdrantMemoryStore:
             payload["source_ts"] = source_ts
         if source_request_id is not None:
             payload["source_request_id"] = source_request_id
+        if episode_id is not None:
+            payload["episode_id"] = episode_id
         self.client.upsert(
             collection_name=self.collection,
-            points=[
-                PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload=payload,
-                )
-            ],
+            points=[PointStruct(id=point_id, vector=vector, payload=payload)],
         )
         return point_id
 
@@ -92,20 +80,16 @@ class QdrantMemoryStore:
         user_id: str,
         top_k: int = 100,
         limit: Optional[int] = None,
+        facts_only: bool = True,
     ) -> List[dict]:
-        limit = limit or top_k
+        must = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        if facts_only:
+            must.append(FieldCondition(key="unit_type", match=MatchValue(value="fact")))
         response = self.client.query_points(
             collection_name=self.collection,
             query=query_vector,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="user_id",
-                        match=MatchValue(value=user_id),
-                    )
-                ]
-            ),
-            limit=limit,
+            query_filter=Filter(must=must),
+            limit=limit or top_k,
             with_payload=True,
         )
         return [
@@ -117,6 +101,7 @@ class QdrantMemoryStore:
                 "unit_type": point.payload.get("unit_type", "fact"),
                 "source_ts": point.payload.get("source_ts"),
                 "source_request_id": point.payload.get("source_request_id"),
+                "episode_id": point.payload.get("episode_id"),
             }
             for point in response.points
         ]
