@@ -17,6 +17,8 @@ test_qdrant_storage_stepcheck/
 
 # Benchmark results
 bench_results*.json
+bench_episode_*.log
+extract_facts_output*.json
 logs/
 
 # Python cache
