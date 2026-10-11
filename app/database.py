@@ -60,6 +60,12 @@ class MemoryUnit(Base):
     subject = Column(String(500), nullable=True)
     question = Column(Text, nullable=True)
     action = Column(String(500), nullable=True)
+    fact_type = Column(String(32), nullable=True)
+    event_title = Column(String(500), nullable=True)
+    event_subject = Column(String(500), nullable=True)
+    event_problem = Column(Text, nullable=True)
+    event_time = Column(String(500), nullable=True)
+    outcome = Column(Text, nullable=True)
     fact_metadata = Column("metadata", JSON, nullable=True)
     episode_id = Column(String(64), nullable=True, index=True)
     source_ts = Column(Integer, nullable=True)
@@ -85,6 +91,9 @@ def _migrate_sqlite():
             additions = {
                 "evidence": "TEXT", "source_id": "VARCHAR(255)", "role": "VARCHAR(32)",
                 "subject": "VARCHAR(500)", "question": "TEXT", "action": "VARCHAR(500)",
+                "fact_type": "VARCHAR(32)", "event_title": "VARCHAR(500)",
+                "event_subject": "VARCHAR(500)", "event_problem": "TEXT",
+                "event_time": "VARCHAR(500)", "outcome": "TEXT",
                 "metadata": "JSON", "episode_id": "VARCHAR(64)",
             }
             for name, type_sql in additions.items():
