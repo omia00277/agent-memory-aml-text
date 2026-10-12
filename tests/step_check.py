@@ -137,6 +137,8 @@ def section_4b_parse():
 
 def section_5_embed(texts):
     banner("5. 向量编码 sf_client.embed()")
+    # consolidate() 返回的是 dict 单元，取 text 字段喂给 embedding
+    texts = [t.get("text") if isinstance(t, dict) else t for t in texts]
     print(f"输入 {len(texts)} 条文本:")
     for t in texts:
         print(f"  - {t}")
@@ -152,6 +154,7 @@ def section_6_upsert(units, vectors):
     banner("6. Qdrant 写入 qdrant_store.upsert()")
     ids = []
     for content, vec in zip(units, vectors):
+        content = content.get("text") if isinstance(content, dict) else content
         point_id = qdrant_store.upsert(
             user_id=USER_ID,
             session_id=SESSION_ID,

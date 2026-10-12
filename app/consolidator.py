@@ -42,7 +42,12 @@ SYSTEM_PROMPT = (
     "每条 Fact 的 text 必须脱离原始对话也能理解。\n"
     "明确区分用户实际执行的行为、助手提出的建议、尚未执行的计划、假设、已确认的信息及真实结果。\n"
     "不能因为助手建议了某件事，就推断用户执行了它。不能因为先发生 A 再发生 B，就推断 A 导致 B。\n"
-    "单纯的疑问句不能自动转化为用户已经执行的行动或已经确认的事实。\n"
+    "单纯的疑问句不能自动转化为用户已经执行的行动或已经确认的事实。\n\n"
+    "5、输出格式要求\n"
+    "你的唯一输出必须是一个合法的 JSON 对象，其顶层结构为 {\"facts\": [...]}，"
+    "并严格符合给定的 JSON Schema：每条 fact 的必填字段都必须给出（没有对应信息时填 null）。\n"
+    "以纯 JSON 文本输出：不要输出 Markdown 代码围栏（```json ... ```），"
+    "不要输出任何前言、注释、说明或后语，不要输出 schema 之外的其他字段。\n"
 )
 
 FACT_SCHEMA = {
@@ -172,10 +177,15 @@ def consolidate(messages_text: str) -> List[dict]:
         units = _parse_llm_output(output)
         if units:
             return units
-        logger.warning("Structured fact extraction returned no facts; using fallback.")
+        # LLM 正常返回但判定本块没有值得记忆的事实：尊重其过滤结果，
+        # 不做句子切分兜底（否则问候/寒暄等噪声会被重新拆成"事实"）。
+        logger.warning("Structured fact extraction returned no facts; skipping sentence-split fallback.")
+        return []
     except Exception as e:
-        logger.warning(f"Structured fact extraction failed ({e}); using fallback.")
-    return _split_sentences(messages_text)
+        # LLM 调用/内容异常（网络、超时、401、JSON 解析失败等）：
+        # 句子切分兜底仍然可用，保证写入不因模型故障而完全缺失。
+        logger.warning(f"Structured fact extraction failed ({e}); using sentence-split fallback.")
+        return _split_sentences(messages_text)
 
 
 def fact_text(fact: dict) -> str:

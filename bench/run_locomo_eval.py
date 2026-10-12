@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=100)
     parser.add_argument("--include-captions", action="store_true")
     parser.add_argument("--max-questions", type=int, default=0, help="0 = all")
+    parser.add_argument("--category", type=int, default=0, help="only evaluate questions of this category (0 = all cats)")
     parser.add_argument("--output", default="bench_results.json")
     parser.add_argument(
         "--tag",
@@ -189,6 +190,8 @@ def main():
                 )
 
             qs = questions_by_sample.get(sid, [])
+            if args.category:
+                qs = [q for q in qs if str(q.get("category")) == str(args.category)]
             if args.max_questions:
                 qs = qs[: args.max_questions]
             for qi, q in enumerate(qs):

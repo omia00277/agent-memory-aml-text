@@ -1,6 +1,10 @@
 # Virtual environments
 venv/
 agent_memory_dl/
+.venv/
+
+# Dataset (not to be distributed - competition data)
+LoCoMo_refined-main/
 
 # Environment variables
 .env
@@ -51,3 +55,27 @@ pdf_extracts/
 sshpass_*.deb
 qdrant_test_gpt4o/
 test_gpt4o.db
+
+# Local tooling & walkthrough/debug artifacts (not part of the repo)
+plink.exe
+pscp.exe
+_sshrun.ps1
+_scpput.ps1
+_scpget.ps1
+analyze_cat1.py
+flow_server.py
+dsl_flow.log
+bench_results_cat1*.json
+code_sync.tar
+deploy.tar
+debug_chunk0.py
+_chunk_stats.py
+_cat_analysis.py
+query_embed_test.py
+ab_prefix.py
+progress_check.py
+status_check2.py
+replay_episode.py
+verify_bigchunk.py
+setup_server.sh
+survey.sh

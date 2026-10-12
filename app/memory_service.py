@@ -25,6 +25,14 @@ def _normalize_content(content: Union[str, List[dict]]) -> str:
     return str(content)
 
 
+def _build_query_text(query: Union[str, List[dict]], options: Optional[List[str]] = None) -> str:
+    """Serialize the search query, appending multiple-choice options if present."""
+    query_text = _normalize_content(query)
+    if options:
+        query_text += "\n" + "\n".join(options)
+    return query_text
+
+
 def _serialize_messages(messages: List) -> str:
     return "\n".join(f"{msg.role}: {_normalize_content(msg.content)}" for msg in messages)
 
@@ -203,7 +211,7 @@ def _assign_episode(db, fact: dict, vector: List[float], user_id: str, session_i
     best_sim, best_ep = scored[0]
     if best_sim >= 0.6:
         return _update_episode(best_ep, fact["text"], source_id)
-    if best_sim <= 0.25 and len(candidates) >= 2:
+    if best_sim <= settings.episode_create_sim_threshold and len(candidates) >= 2:
         return _create_episode(db, fact, user_id, session_id, source_id)
     # Ambiguous: ask LLM
     episode_id = _event_decision(fact, candidates)
@@ -262,10 +270,17 @@ def add_memory(request: AddRequest) -> AddResponse:
         consolidated = [_normalize_fact(item) for item in consolidate(text)]
         consolidated = [f for f in consolidated if f.get("text")]
         if not consolidated:
-            consolidated = [{"text": text, "evidence": text}]
+            if settings.enable_llm_consolidation:
+                # consolidate() 返回空 = LLM 正常判定本块没有值得记忆的事实
+                # （噪声已被过滤；只有 LLM 内容异常才会走句子切分兜底）。
+                # 因此这里不再把整块原文硬塞成一条"事实"。
+                logger.info("No facts from consolidation; storing no memory units for this chunk (request_id=%s).", request.request_id)
+            else:
+                # LLM 归档被显式关闭且句子切分也无结果：退化为整块原文（保留旧行为）。
+                consolidated = [{"text": text, "evidence": text}]
 
         raw_sentences = []
-        if settings.enable_raw_sentence_fallback:
+        if settings.enable_raw_sentence_fallback and consolidated:
             for sentence in _split_sentences(text):
                 sentence_text = sentence.get("text", sentence) if isinstance(sentence, dict) else sentence
                 if _is_meaningful_raw_sentence(sentence_text) and not any(_is_near_duplicate(sentence_text, fact["text"], settings.search_dedup_threshold) for fact in consolidated):
@@ -333,10 +348,8 @@ def add_memory(request: AddRequest) -> AddResponse:
 
 
 def search_memory(request: SearchRequest) -> SearchResponse:
-    query_text = _normalize_content(request.query)
-    if request.options:
-        query_text += "\n" + "\n".join(request.options)
-    query_vector = sf_client.embed([query_text])[0]
+    query_text = _build_query_text(request.query, request.options)
+    query_vector = sf_client.embed([settings.search_query_prefix + query_text])[0]
     recall = min(max(request.top_k, 1) * max(settings.dense_recall_multiplier, settings.episode_fact_recall_multiplier), 1000)
     candidates = qdrant_store.search(query_vector=query_vector, user_id=request.user_id, top_k=request.top_k, limit=recall, facts_only=True)
     if not candidates:
@@ -373,9 +386,15 @@ def search_memory(request: SearchRequest) -> SearchResponse:
         for item in ordered:
             unit = units.get(item["id"])
             event_id = unit.episode_id if unit and unit.episode_id else item.get("episode_id") or f"unit:{item['id']}"
-            group = groups.setdefault(event_id, {"best": item, "items": [], "score": item.get("score", 0.0)})
+            group = groups.setdefault(event_id, {"best": item, "items": [], "base_score": 0.0})
             group["items"].append(item)
-            group["score"] = max(group["score"], item.get("score", 0.0)) + min(0.03, 0.01 * len(group["items"]))
+            group["base_score"] = max(group["base_score"], item.get("score", 0.0))
+        for group in groups.values():
+            bonus = min(
+                settings.episode_group_bonus_cap,
+                settings.episode_group_bonus_per_fact * len(group["items"]),
+            )
+            group["score"] = group["base_score"] + bonus
         ranked_groups = sorted(groups.values(), key=lambda g: g["score"], reverse=True)
         data = []
         for group in ranked_groups:

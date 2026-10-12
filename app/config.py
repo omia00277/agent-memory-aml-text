@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./aml_memory.db"
 
     enable_llm_consolidation: bool = True
-    llm_consolidation_max_tokens: int = 1024
+    llm_consolidation_max_tokens: int = 8192
 
     dense_weight: float = 0.50
     keyword_weight: float = 0.30
@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     keyword_ngram_max: int = 3
     keyword_phrase_weight: float = 0.7
     search_dedup_threshold: float = 0.85
+    # bge 风格检索指令：仅加在 embedding 环节的 query 侧（短查询×长文档时提升区分度），
+    # 不用于 rerank / 关键词打分（交叉编码器与词法匹配都不需要前缀）。
+    search_query_prefix: str = "Represent this sentence for searching relevant passages: "
 
     enable_raw_sentence_fallback: bool = True
     raw_fallback_per_chunk: int = 8
@@ -46,6 +49,12 @@ class Settings(BaseSettings):
     episode_candidate_limit: int = 12
     episode_fact_recall_multiplier: int = 3
     episode_max_facts: int = 20
+    episode_group_bonus_per_fact: float = 0.03
+    episode_group_bonus_cap: float = 0.15
+    # episode 归属：text_similarity 低于该阈值且候选>=2 才直接新建（明确的"无关"）；
+    # 高于该阈值但 <0.6（合并阈值）则进入模糊带走 LLM 判定。
+    # 原值 0.25 会让词面 Jaccard 失真的情况（如语义 cosine 0.68 但 Jaccard 0.09）被误判为"新主题"。
+    episode_create_sim_threshold: float = 0.05
 
     memory_system_key: str = ""
     log_level: str = "INFO"

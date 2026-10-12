@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import List, Optional
 
 import httpx
@@ -88,7 +89,7 @@ class SiliconFlowClient:
         schema: dict,
         max_tokens: int = 1024,
     ) -> dict:
-        """Use OpenAI structured outputs, with JSON-object fallback for compatible APIs."""
+        """Use OpenAI structured outputs, with tolerant JSON parsing for compatible APIs."""
         kwargs = {
             "model": settings.llm_model,
             "messages": messages,
@@ -104,13 +105,43 @@ class SiliconFlowClient:
                 },
             )
         except Exception as structured_error:
-            logger.warning(f"Structured output unavailable; using JSON fallback: {structured_error}")
-            response = self.chat_client.chat.completions.create(
-                **kwargs,
-                response_format={"type": "json_object"},
-            )
+            logger.warning(f"Structured output unavailable; using json_object fallback: {structured_error}")
+            # OpenAI requires the word "json" in the messages for json_object mode.
+            # Our SYSTEM_PROMPT now mentions JSON explicitly, but other callers may not,
+            # so append an output-format hint when the messages lack the keyword.
+            if not any("json" in str(m.get("content", "")).lower() for m in kwargs["messages"]):
+                kwargs = {
+                    **kwargs,
+                    "messages": list(kwargs["messages"])
+                    + [{"role": "user", "content": "请以 JSON 格式输出（output as JSON object）。"}],
+                }
+            try:
+                response = self.chat_client.chat.completions.create(
+                    **kwargs,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as plain_error:
+                logger.warning(f"json_object unavailable ({plain_error}); using plain chat fallback.")
+                response = self.chat_client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content or "{}"
-        return json.loads(content)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("Model output was not strict JSON; attempting tolerant extraction.")
+            return json.loads(self._extract_json_object(content))
+
+    @staticmethod
+    def _extract_json_object(content: str) -> str:
+        """Tolerantly pull a JSON object out of model output (code fences / prose)."""
+        fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, flags=re.DOTALL)
+        if fence:
+            return fence.group(1)
+        start = content.find("{")
+        if start >= 0:
+            end = content.rfind("}")
+            if end > start:
+                return content[start : end + 1]
+        return content
 
 
 sf_client = SiliconFlowClient()
